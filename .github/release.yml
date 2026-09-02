@@ -1,0 +1,6 @@
+# GitHub's generated release notes: leave tagpr's own release pull requests
+# out of the changelog.
+changelog:
+  exclude:
+    labels:
+      - tagpr

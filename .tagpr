@@ -1,0 +1,13 @@
+# tagpr (https://github.com/Songmu/tagpr) keeps a release pull request open
+# against main; merging it tags the release. Config in git-config format.
+[tagpr]
+	releaseBranch = main
+	# herdr-plugin.toml's `version = "X.Y.Z"` is the version of record:
+	# install.sh derives the download tag from it, so it and the tag must
+	# agree. tagpr bumps it in the release PR and reads it back when tagging.
+	versionFile = herdr-plugin.toml
+	vPrefix = true
+	changelog = true
+	# The GitHub Release (with the signed binaries) is created by GoReleaser
+	# in the same workflow run, not by tagpr.
+	release = false

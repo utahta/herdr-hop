@@ -1,0 +1,106 @@
+name: tagpr
+
+# On every push to main, tagpr opens or refreshes the release pull request
+# (version bump in herdr-plugin.toml + CHANGELOG). When that pull request is
+# merged, tagpr tags the merge commit and this same run publishes the
+# release: a tag pushed with GITHUB_TOKEN does not start other workflows, so
+# GoReleaser runs here, gated on the tag.
+#
+# Recovery: if publishing fails after the tag exists (test, signing or
+# GoReleaser), a re-run cannot go through tagpr again — the tag is already
+# there. Dispatch this workflow by hand with that tag instead; only the
+# publish steps run then, and GoReleaser reuses the leftover draft release
+# (release.use_existing_draft / replace_existing_artifacts).
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)publish, e.g. v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  tagpr:
+    runs-on: ubuntu-latest
+    steps:
+      # A manual dispatch publishes the given tag; a push works on main.
+      # The input is validated first and used only through environment
+      # variables: an expression expanded inside `run:` would be
+      # interpreted by the shell, and this job goes on to handle the
+      # release signing key.
+      - name: Validate the requested tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          printf '%s' "$INPUT_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "error: tag must look like v1.2.3, got: $INPUT_TAG" >&2; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          # refs/tags/… so a branch that happens to share the tag's name can
+          # never be checked out, signed and published in its place.
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: tagpr
+        if: github.event_name == 'push'
+        uses: Songmu/tagpr@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The tag to publish: the one tagpr just created on a merged release
+      # pull request, or the one given to a manual dispatch. Empty on an
+      # ordinary push, which only refreshes the release pull request.
+      - id: rel
+        env:
+          TAGPR_TAG: ${{ steps.tagpr.outputs.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${TAGPR_TAG:-$INPUT_TAG}"
+          if [ -n "$tag" ]; then
+            printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+              echo "error: unexpected tag: $tag" >&2; exit 1; }
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag matches manifest version
+        if: steps.rel.outputs.tag != ''
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: sh scripts/check-tag-version.sh "$TAG"
+
+      - uses: actions/setup-go@v5
+        if: steps.rel.outputs.tag != ''
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        if: steps.rel.outputs.tag != ''
+        run: go test ./...
+
+      - name: Write signing key
+        if: steps.rel.outputs.tag != ''
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release_signing_key"
+
+      - uses: goreleaser/goreleaser-action@v6
+        if: steps.rel.outputs.tag != ''
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.rel.outputs.tag }}
+          RELEASE_SIGNING_KEY_FILE: ${{ runner.temp }}/release_signing_key
