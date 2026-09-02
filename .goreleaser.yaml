@@ -1,0 +1,54 @@
+version: 2
+
+project_name: herdr-hop
+
+builds:
+  - main: .
+    binary: herdr-hop
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "herdr-hop_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+# Sign checksums.txt with an OpenSSH signature so install.sh can verify it
+# with plain ssh-keygen (no extra tooling on the user's machine). The
+# private key is provided by CI via RELEASE_SIGNING_KEY_FILE; the matching
+# public key is committed as release/signing-key.pub.
+signs:
+  - cmd: ssh-keygen
+    args:
+      - "-Y"
+      - "sign"
+      - "-f"
+      - "{{ .Env.RELEASE_SIGNING_KEY_FILE }}"
+      - "-n"
+      - "herdr-hop-release"
+      - "${artifact}"
+    signature: "${artifact}.sig"
+    artifacts: checksum
+
+release:
+  # GoReleaser creates the release as a draft internally and publishes it
+  # only after every asset (including the .sig) is uploaded. These two
+  # settings make a retry after a mid-run failure reuse the leftover draft
+  # and replace any assets it already uploaded.
+  use_existing_draft: true
+  replace_existing_artifacts: true

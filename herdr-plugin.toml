@@ -1,0 +1,43 @@
+id = "utahta.hop"
+name = "Hop"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Hop to a repository, worktree, or open workspace; clone what you don't have; create worktrees."
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["sh", "install.sh"]
+
+[[panes]]
+id = "hop"
+title = "Hop"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["./herdr-hop", "tui", "--mode", "hop"]
+
+[[panes]]
+id = "worktree"
+title = "Hop: Worktree"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["./herdr-hop", "tui", "--mode", "worktree"]
+
+[[actions]]
+id = "open"
+title = "Hop: Open"
+command = ["./herdr-hop", "open", "--mode", "hop"]
+contexts = ["global"]
+
+[[actions]]
+id = "hop"
+title = "Hop: Repositories"
+command = ["./herdr-hop", "open", "--mode", "hop"]
+contexts = ["global"]
+
+[[actions]]
+id = "worktree"
+title = "Hop: New worktree"
+command = ["./herdr-hop", "open", "--mode", "worktree"]
+contexts = ["global"]

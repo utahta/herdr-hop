@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Tag/manifest version check (both cases)
+        run: |
+          sh scripts/check-tag-version.sh "v$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' herdr-plugin.toml)"
+          if sh scripts/check-tag-version.sh v999.999.999; then
+            echo "check-tag-version.sh accepted a mismatched tag" >&2
+            exit 1
+          fi
+      - name: Installer integration tests
+        run: sh scripts/install_test.sh
+
+  goreleaser-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # --snapshot skips publish/announce/validate but still runs sign, and
+      # fork PRs do not receive repository secrets, so this job signs with a
+      # throwaway key generated on the spot.
+      - name: Generate throwaway signing key
+        run: ssh-keygen -t ed25519 -N '' -f "$RUNNER_TEMP/release_signing_key" -q
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean
+        env:
+          RELEASE_SIGNING_KEY_FILE: ${{ runner.temp }}/release_signing_key
+      - name: Check artifacts
+        run: |
+          set -eu
+          count=$(ls dist/herdr-hop_v*.tar.gz | wc -l)
+          if [ "$count" -ne 4 ]; then
+            echo "expected 4 archives, got $count" >&2
+            ls dist/ >&2
+            exit 1
+          fi
+          test -s dist/checksums.txt
+          test -s dist/checksums.txt.sig
+          printf 'herdr-hop-release %s\n' "$(cut -d' ' -f1,2 < "$RUNNER_TEMP/release_signing_key.pub")" > "$RUNNER_TEMP/allowed_signers"
+          ssh-keygen -Y verify -f "$RUNNER_TEMP/allowed_signers" -I herdr-hop-release -n herdr-hop-release \
+            -s dist/checksums.txt.sig < dist/checksums.txt
