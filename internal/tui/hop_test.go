@@ -188,6 +188,38 @@ func TestHopModelLoadingBlocksActions(t *testing.T) {
 	}
 }
 
+func TestHopModelAgentBadge(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		open   hop.OpenState
+		count  int
+		glyph  string
+		color  string
+	}{
+		{"working", hop.OpenOpen, 1, "●", "3"},
+		{"blocked", hop.OpenOpen, 2, "●2", "1"},
+		{"done", hop.OpenOpen, 1, "●", "6"},
+		{"idle", hop.OpenOpen, 3, "○3", "2"},
+		{"unknown", hop.OpenOpen, 1, "·", "8"},
+		{"", hop.OpenOpen, 0, "·", "8"},
+		{"future_status", hop.OpenOpen, 2, "·2", "8"},
+		{"blocked", hop.OpenUnknown, 1, "?", "3"},
+		{"working", hop.OpenClosed, 1, "", ""},
+	} {
+		t.Run(fmt.Sprintf("%s/%d", tc.status, tc.open), func(t *testing.T) {
+			m := NewHop(config.Config{}, &fakeClient{}, &fakeCloner{}, log.New(io.Discard, "", 0), false)
+			mm, _ := m.Update(loadedMsg{gen: 1, cands: []hop.Candidate{{Kind: hop.KindRepo, Path: "/r", Label: "r", AgentStatus: tc.status, OpenState: tc.open, OpenCount: tc.count}}})
+			glyph, style := mm.(HopModel).badge(0)
+			if glyph != tc.glyph {
+				t.Errorf("glyph = %q, want %q", glyph, tc.glyph)
+			}
+			if tc.color != "" && style.GetForeground() != lipgloss.Color(tc.color) {
+				t.Errorf("color = %v, want %s", style.GetForeground(), tc.color)
+			}
+		})
+	}
+}
+
 func TestHopModelOpenBadgeWithoutSnapshot(t *testing.T) {
 	m := NewHop(config.Config{SearchPaths: []string{"/x"}}, &fakeClient{}, &fakeCloner{}, log.New(io.Discard, "", 0), false)
 	cands := []hop.Candidate{
@@ -206,13 +238,13 @@ func TestHopModelOpenBadgeWithoutSnapshot(t *testing.T) {
 		}
 		return ""
 	}
-	if l := find("w"); !strings.Contains(l, "●") {
+	if l := find("w"); !strings.Contains(l, "·") {
 		t.Errorf("worktree open via list must show the glyph: %q", l)
 	}
-	if l := find("r"); !strings.Contains(l, "●3") {
+	if l := find("r"); !strings.Contains(l, "·3") {
 		t.Errorf("count glyph: %q", l)
 	}
-	if l := find("c"); strings.Contains(l, "●") {
+	if l := find("c"); strings.Contains(l, "·") {
 		t.Errorf("closed must not show the glyph: %q", l)
 	}
 }

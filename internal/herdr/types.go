@@ -14,6 +14,7 @@ type Workspace struct {
 	Number      int                `json:"number"`
 	ActiveTabID string             `json:"active_tab_id"`
 	Focused     bool               `json:"focused"`
+	AgentStatus string             `json:"agent_status"`
 	Worktree    *WorkspaceWorktree `json:"worktree"`
 }
 

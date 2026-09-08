@@ -107,6 +107,8 @@ type Candidate struct {
 	OpenWorkspaceID string
 	// OpenCount is the number of workspaces matching this row's path (badge only).
 	OpenCount int
+	// AgentStatus is the highest-priority status of the path-matching workspaces.
+	AgentStatus string
 	// RepoID is "host/owner/repo" (lower-cased) derived from the origin remote,
 	// or "" when unknown. It identifies the repository independently of where
 	// it is checked out or how it is labelled.
@@ -457,6 +459,9 @@ func Merge(repos []scan.Repo, worktrees []gitx.WorktreeListing, failed map[strin
 			if p != "" {
 				if row, ok := byPath[p]; ok && row.Kind != KindUnknown {
 					matches[p] = append(matches[p], wsMatch{ws.ID, ws.Number, ws.Worktree != nil})
+					if agentStatusPriority(ws.AgentStatus) > agentStatusPriority(row.AgentStatus) {
+						row.AgentStatus = ws.AgentStatus
+					}
 					if ws.Focused {
 						row.Current = true
 					}
@@ -466,6 +471,7 @@ func Merge(repos []scan.Repo, worktrees []gitx.WorktreeListing, failed map[strin
 			standalone = append(standalone, Candidate{
 				Kind: KindWorkspace, Path: p, Label: workspaceLabel(ws, p, searchPaths),
 				OpenState: OpenOpen, OpenWorkspaceID: ws.ID, OpenCount: 1, Current: ws.Focused,
+				AgentStatus: ws.AgentStatus,
 			})
 		}
 		for p, ms := range matches {
@@ -574,6 +580,22 @@ func ApplyWorktreeStates(cands []Candidate, st WorktreeStateResult) {
 			c.OpenState = OpenClosed
 			c.OpenWorkspaceID = ""
 		}
+	}
+}
+
+// Match herdr's workspace attention order, including unacknowledged completion.
+func agentStatusPriority(status string) int {
+	switch status {
+	case "blocked":
+		return 4
+	case "done":
+		return 3
+	case "working":
+		return 2
+	case "idle":
+		return 1
+	default:
+		return 0
 	}
 }
 

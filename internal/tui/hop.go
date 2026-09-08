@@ -52,11 +52,13 @@ var (
 	// violet, so the tree structure reads by hue: repositories stay in the
 	// default color, their worktrees hang below in this one. Hue only —
 	// weight is reserved for the cursor row.
-	styleBranch = lipgloss.NewStyle().Foreground(lipgloss.Color("139"))
-	styleErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	styleWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	styleOpen   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	styleKind   = map[hop.Kind]lipgloss.Style{
+	styleBranch  = lipgloss.NewStyle().Foreground(lipgloss.Color("139"))
+	styleErr     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	styleWarn    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	styleOpen    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	styleDone    = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	styleNoAgent = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleKind    = map[hop.Kind]lipgloss.Style{
 		hop.KindRepo:      lipgloss.NewStyle().Foreground(lipgloss.Color("4")),
 		hop.KindWorktree:  lipgloss.NewStyle().Foreground(lipgloss.Color("5")),
 		hop.KindWorkspace: lipgloss.NewStyle().Foreground(lipgloss.Color("6")),
@@ -464,18 +466,26 @@ func (m HopModel) rowSegs(i int) []rowSeg {
 	return segs
 }
 
-// badge is row i's open-state glyph, shown in its own column between the
-// left cell and the path: ● open (●N: N workspaces), ? state unknown.
-// OpenState says whether it is open (worktree list or snapshot); OpenCount
-// is only how many the snapshot confirmed, so a snapshot failure does not
-// hide a known-open row.
+// A known-open row keeps its badge even when the snapshot lacks agent status.
 func (m HopModel) badge(i int) (string, lipgloss.Style) {
 	c, _ := m.rowAt(i)
 	switch {
-	case c.OpenState == hop.OpenOpen && c.OpenCount > 1:
-		return fmt.Sprintf("●%d", c.OpenCount), styleOpen
 	case c.OpenState == hop.OpenOpen:
-		return "●", styleOpen
+		glyph, style := "·", styleNoAgent
+		switch c.AgentStatus {
+		case "working":
+			glyph, style = "●", styleWarn
+		case "blocked":
+			glyph, style = "●", styleErr
+		case "done":
+			glyph, style = "●", styleDone
+		case "idle":
+			glyph, style = "○", styleOpen
+		}
+		if c.OpenCount > 1 {
+			glyph = fmt.Sprintf("%s%d", glyph, c.OpenCount)
+		}
+		return glyph, style
 	case (c.Kind == hop.KindRepo || c.Kind == hop.KindWorktree) && c.OpenState == hop.OpenUnknown:
 		return "?", styleWarn
 	default:
