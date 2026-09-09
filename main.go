@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/utahta/herdr-hop/internal/gitx"
 	"github.com/utahta/herdr-hop/internal/herdr"
 	"github.com/utahta/herdr-hop/internal/logging"
+	"github.com/utahta/herdr-hop/internal/recent"
 	"github.com/utahta/herdr-hop/internal/tui"
 )
 
@@ -62,7 +64,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "config:", err)
 			os.Exit(1)
 		}
-		model := tui.NewHop(cfg, h, gitx.New(), lg, *mode == "worktree")
+		history := recent.New(os.Getenv("HERDR_PLUGIN_STATE_DIR"), os.Getenv("HERDR_SOCKET_PATH")+"\n"+os.Getenv("HERDR_SESSION"))
+		h.OnFocus = func(id string) {
+			if err := history.Record(id, time.Now()); err != nil {
+				lg.Printf("history: %v", err)
+			}
+		}
+		model := tui.NewHop(cfg, h, gitx.New(), lg, *mode == "worktree").WithHistory(history)
 		if gh := forge.NewGitHub(); gh != nil {
 			gh.Log = lg
 			model = model.WithForge(gh)

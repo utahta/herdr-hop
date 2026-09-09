@@ -23,6 +23,7 @@ import (
 	"github.com/utahta/herdr-hop/internal/gitx"
 	"github.com/utahta/herdr-hop/internal/herdr"
 	"github.com/utahta/herdr-hop/internal/hop"
+	"github.com/utahta/herdr-hop/internal/recent"
 	"github.com/utahta/herdr-hop/internal/scan"
 )
 
@@ -78,6 +79,7 @@ type loadedMsg struct {
 	// occupancy is where herdr's panes are, from the load's snapshot; its
 	// OK is false when the snapshot could not be read (see hop.Loaded).
 	occupancy hop.Occupancy
+	visits    map[string]int64
 }
 
 // resolvedMsg carries the background remote-identity resolution of one load
@@ -138,7 +140,9 @@ type HopModel struct {
 	log *log.Logger
 	// forge answers PR titles and states for the branch screen; nil when
 	// no forge client is available (gh not installed).
-	forge PRInfoSource
+	forge   PRInfoSource
+	history *recent.Store
+	visits  map[string]int64
 	// worktreeMode: started with --mode worktree, so Enter on a repository
 	// goes to the branch screen instead of opening a workspace.
 	worktreeMode bool
@@ -160,13 +164,6 @@ type HopModel struct {
 	matches map[int]rowMatch
 	// cloneRow is the synthetic clone candidate for the current query, or nil.
 	cloneRow *hop.Candidate
-	// collapsed holds normalized repo roots whose worktree group is folded in
-	// the tree view. Keyed by path (not candidate index) so the fold state
-	// survives reloads and re-sorts, and is restored when the query is cleared.
-	collapsed map[string]bool
-	// tree is the grouped (empty-query) view's metadata; inactive while the
-	// flat fuzzy-filtered list is shown.
-	tree treeState
 	// curPR is the pull request the current query denotes, or nil.
 	curPR  *clone.PR
 	cursor int
@@ -241,7 +238,7 @@ func NewHop(cfg config.Config, h herdr.Client, git GitOps, lg *log.Logger, workt
 		ti.PromptStyle = stylePromptWorktree
 	}
 	ti.Focus()
-	return HopModel{cfg: cfg, h: h, git: git, log: lg, input: ti, loading: true, worktreeMode: worktreeMode, collapsed: map[string]bool{}, loadGen: 1}
+	return HopModel{cfg: cfg, h: h, git: git, log: lg, input: ti, loading: true, worktreeMode: worktreeMode, loadGen: 1}
 }
 
 // WithForge equips the model with a source of pull request details for the
@@ -249,6 +246,12 @@ func NewHop(cfg config.Config, h herdr.Client, git GitOps, lg *log.Logger, workt
 // come from git), just no titles or states.
 func (m HopModel) WithForge(f PRInfoSource) HopModel {
 	m.forge = f
+	return m
+}
+
+// WithHistory enables persistent visits for ordering equal agent states.
+func (m HopModel) WithHistory(history *recent.Store) HopModel {
+	m.history = history
 	return m
 }
 
@@ -398,8 +401,7 @@ func matchedSegs(raw string, base lipgloss.Style, pos []int, quiet bool) []rowSe
 	return segs
 }
 
-// rowSegs assembles row i's left cell: the primary name, kind tag, tree
-// badge, branch and status badges. The path column is appended by the
+// rowSegs assembles row i's left cell: repository, branch and status badges. The path column is appended by the
 // caller, which aligns it across rows. Segments so the cursor row can be
 // re-rendered with emphasis: every segment bold with its Faint dimming
 // lifted, colors kept — text emphasis rather than a reversed/background
@@ -412,8 +414,9 @@ func (m HopModel) rowSegs(i int) []rowSeg {
 		segs = append(segs, rowSeg{text: text, style: style})
 	}
 	mi := m.matches[m.view[i]]
-	if m.tree.active && m.tree.child[m.view[i]] {
-		add("└─ ", styleBranch)
+	if c.Kind == hop.KindWorktree && c.RepoLabel != "" {
+		segs = append(segs, matchedSegs(c.RepoLabel, lipgloss.NewStyle(), mi.repo, false)...)
+		add("  ", styleDim)
 	}
 	switch {
 	case c.Kind == hop.KindWorktree && c.Branch != "":
@@ -422,31 +425,16 @@ func (m HopModel) rowSegs(i int) []rowSeg {
 		segs = append(segs, matchedSegs(c.Branch, styleBranch, mi.branch, false)...)
 	case c.Kind == hop.KindWorktree:
 		// Detached: no branch to show, but the row is still a worktree and
-		// keeps the tree hue.
+		// keeps the worktree hue.
 		segs = append(segs, matchedSegs(c.Label, styleBranch, mi.label, false)...)
 	default:
 		segs = append(segs, matchedSegs(c.Label, lipgloss.NewStyle(), mi.label, false)...)
 	}
 	switch c.Kind {
 	case hop.KindRepo, hop.KindWorktree:
-		// The dominant kinds carry no tag: worktrees already read as such
-		// from the tree indent.
+		// Repository and branch text identify checkout rows.
 	default:
 		add("  "+c.Kind.String(), styleKind[c.Kind].Faint(true))
-	}
-	if m.tree.active {
-		if n := m.tree.count[m.view[i]]; n > 0 {
-			// ASCII fold markers: - open (tab folds), + folded (tab expands).
-			// Triangle glyphs render as tiny dots in some fonts.
-			marker, word := "-", "worktrees"
-			if m.collapsed[c.Path] {
-				marker = "+"
-			}
-			if n == 1 {
-				word = "worktree"
-			}
-			add(fmt.Sprintf("  %s %d %s", marker, n, word), styleDim)
-		}
 	}
 	switch {
 	case c.Kind == hop.KindClone, c.Kind == hop.KindClonePull:
@@ -462,6 +450,9 @@ func (m HopModel) rowSegs(i int) []rowSeg {
 		if n := disp(prNote(m.notes, idx)); n != "" {
 			add(n, styleOpen)
 		}
+	}
+	if c.Current {
+		add("  [current]", styleDim)
 	}
 	return segs
 }
@@ -543,17 +534,7 @@ func truncateSegs(segs []rowSeg, width int) []rowSeg {
 type rowMatch struct {
 	label  []int // rune indexes into Candidate.Label
 	branch []int // rune indexes into Candidate.Branch
-}
-
-// treeState describes a grouped view: which candidate indexes render as
-// indented children, and how many worktrees each repo row groups. Folding
-// only applies to the empty-query view; the filtered view keeps the grouped
-// rendering but ignores (and must not edit) the fold state.
-type treeState struct {
-	active   bool         // grouped rendering (indented children) applies
-	foldable bool         // Tab folding applies (empty-query view only)
-	child    map[int]bool // candidate index -> rendered indented under its repo
-	count    map[int]int  // repo candidate index -> grouped worktree count
+	repo   []int // rune indexes into Candidate.RepoLabel
 }
 
 func (m HopModel) Init() tea.Cmd { return tea.Batch(textinput.Blink, m.load(m.loadGen)) }
@@ -563,12 +544,25 @@ func (m HopModel) Init() tea.Cmd { return tea.Batch(textinput.Blink, m.load(m.lo
 // them, so they are resolved lazily (startResolve, once a query names a
 // repository or PR) and arrive via resolvedMsg.
 func (m HopModel) load(gen int) tea.Cmd {
-	cfg, h, git, lg := m.cfg, m.h, m.git, m.log
+	cfg, h, git, lg, history := m.cfg, m.h, m.git, m.log, m.history
 	return func() tea.Msg {
 		start := time.Now()
 		l, err := hop.Load(timedLister{h, lg}, timedGitLister{git, lg}, cfg.ScanTargets(), cfg.SearchPaths)
 		lg.Printf("load gen %d: build %v (%d candidates)", gen, time.Since(start), len(l.Cands))
-		return loadedMsg{cands: l.Cands, warn: err, gen: gen, occupancy: l.Occupancy}
+		var ids []string
+		for _, c := range l.Cands {
+			ids = append(ids, c.WorkspaceIDs...)
+		}
+		visits, historyErr := history.Load(ids)
+		if historyErr != nil {
+			lg.Printf("history: %v", historyErr)
+		}
+		if gen == 1 {
+			if historyErr := history.Record(l.CurrentWorkspaceID, time.Now()); historyErr != nil {
+				lg.Printf("history: %v", historyErr)
+			}
+		}
+		return loadedMsg{cands: l.Cands, warn: err, gen: gen, occupancy: l.Occupancy, visits: visits}
 	}
 }
 
@@ -720,6 +714,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.log.Printf("loaded %d candidates (search_paths=%v)", len(msg.cands), m.cfg.SearchPaths)
 		m.cands = msg.cands
 		m.occupancy = msg.occupancy
+		m.visits = msg.visits
 		m.labels = make([]string, len(m.cands))
 		for i, c := range m.cands {
 			m.labels[i] = c.Label
@@ -974,7 +969,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.worktreeMode {
-				if repo, label, ok := worktreeRepoFor(c); ok {
+				if repo, label, ok := m.worktreeRepoFor(c); ok {
 					return m.enterBranchScreen(repo, label)
 				}
 				m.errMsg = "select a repository or worktree row to create a worktree from"
@@ -997,7 +992,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok || m.busy() || m.resolvingQuery() {
 				return m, nil
 			}
-			if repo, label, ok := worktreeRepoFor(c); ok {
+			if repo, label, ok := m.worktreeRepoFor(c); ok {
 				return m.enterBranchScreen(repo, label)
 			}
 			return m, nil
@@ -1013,9 +1008,6 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, m.startLoad()
-		case tea.KeyTab:
-			m.toggleGroup()
-			return m, nil
 		case tea.KeyUp, tea.KeyCtrlP:
 			m.moveCursor(-1)
 			return m, nil
@@ -1113,13 +1105,8 @@ func (m *HopModel) refilter() {
 	m.extra = nil
 	m.notes = nil
 	m.matches = nil
-	m.tree = treeState{}
-	// An empty query shows the tree: worktrees grouped under their
-	// repository. A query shows the fuzzy-ranked matches, still grouped —
-	// the fold state is kept but not applied, so every match stays
-	// reachable by typing.
 	if strings.TrimSpace(q) == "" {
-		m.buildTree()
+		m.buildList()
 		if m.cursor >= m.rowCount() {
 			m.cursor = max(0, m.rowCount()-1)
 		}
@@ -1153,7 +1140,7 @@ func (m *HopModel) refilter() {
 		for i := range extra {
 			rows = append(rows, base+i)
 		}
-		m.view = prependUnique(m.groupRows(rows), m.view)
+		m.view = prependUnique(rows, m.view)
 		// Drop rows that must only be reachable through a pull row.
 		kept := m.view[:0]
 		for _, idx := range m.view {
@@ -1179,7 +1166,7 @@ func (m *HopModel) refilter() {
 		same := m.identityMatches(t)
 		switch {
 		case len(same) > 0:
-			m.view = prependUnique(m.groupRows(same), m.view)
+			m.view = prependUnique(same, m.view)
 			m.cursor = 0 // the checkout the input denotes
 		case !m.worktreeMode:
 			// Worktree mode exists to pick an existing repository; cloning is
@@ -1198,45 +1185,9 @@ func (m *HopModel) refilter() {
 	m.scrollToCursor()
 }
 
-// groups maps each repository row to its scanned worktrees: repoIdx is repo
-// path -> candidate index, children is repo candidate index -> worktree
-// candidate indexes (only worktrees whose main checkout is a candidate).
-func (m HopModel) groups() (repoIdx map[string]int, children map[int][]int) {
-	repoIdx = map[string]int{}
-	for i, c := range m.cands {
-		if c.Kind == hop.KindRepo {
-			repoIdx[c.Path] = i
-		}
-	}
-	children = map[int][]int{}
-	for i, c := range m.cands {
-		if c.Kind == hop.KindWorktree {
-			if p, ok := repoIdx[c.RepoRoot]; ok {
-				children[p] = append(children[p], i)
-			}
-		}
-	}
-	return repoIdx, children
-}
-
-// buildFiltered fills view with the query's matches, still grouped: a
-// matching repository brings all its worktrees, a matching worktree brings
-// its repository. Two stages, so that a repo-name query never lands the
-// cursor on a worktree:
-//
-//  1. direct: the raw query against a repo's label, or a worktree's label +
-//     branch;
-//  2. composite (only when nothing in the group matched directly): every
-//     whitespace-separated word must fuzzy-match one of the parent repo
-//     label, the worktree label, or the branch — per field, not against a
-//     concatenation, so a word cannot straddle a field boundary. This is
-//     what makes "repo branch" (and "branch repo") queries work.
-//
-// Groups are ordered by stage, then score, then original position; the
-// cursor lands on the best direct row (its repository on a tie) or, for a
-// composite-only group, on its best worktree.
+// buildFiltered ranks each destination independently; multi-word queries can
+// match the repository and branch in either order.
 func (m *HopModel) buildFiltered(q string) {
-	m.tree = treeState{active: true, child: map[int]bool{}, count: map[int]int{}}
 	m.matches = map[int]rowMatch{}
 	lq := []rune(strings.ToLower(q))
 	var words [][]rune
@@ -1288,355 +1239,77 @@ func (m *HopModel) buildFiltered(q string) {
 		return sum, fieldPos, true
 	}
 
-	type unit struct {
-		stage  int // 0 direct, 1 composite
-		score  int
-		rows   []int // candidate indexes, group head first
-		cursor int   // candidate index the cursor should land on
-	}
-	var units []unit
-	_, children := m.groups()
-	grouped := map[int]bool{}
-	for _, ws := range children {
-		for _, w := range ws {
-			grouped[w] = true
-		}
-	}
-
+	type scored struct{ index, stage, score int }
+	var rows []scored
 	for i, c := range m.cands {
-		if grouped[i] {
-			continue // scored within its repository's group
-		}
-		switch c.Kind {
-		case hop.KindRepo:
-			kids := children[i]
-			repoScore, repoPos, _, repoOK := direct(c.Label, "")
-			if repoOK {
-				m.matches[i] = rowMatch{label: repoPos}
-			}
-			best, ok := repoScore, repoOK // best direct score: orders the group
-			// A sparse match scores zero or below while still being a match,
-			// so "no worktree chosen yet" needs its own flag — a zero
-			// sentinel would leave the cursor on a repo that never matched.
-			cursor, cursorScore, cursorSet := i, 0, false
-			var hit []int // directly matching worktrees
-			for _, w := range kids {
-				wc := m.cands[w]
-				if s, lp, bp, o := direct(wc.Label, wc.Branch); o {
-					m.matches[w] = rowMatch{label: lp, branch: bp}
-					hit = append(hit, w)
-					if !ok || s > best {
-						best, ok = s, true
-					}
-					if !cursorSet || s > cursorScore {
-						cursor, cursorScore, cursorSet = w, s, true
-					}
-				}
-			}
-			if ok { // stage 0: something in the group matched directly
-				rows := []int{i}
-				if repoOK {
-					// The repo itself matched: show everything and keep the
-					// cursor on the repo, even when a worktree outscores it
-					// on label overlap — Enter must not open a worktree the
-					// user did not name.
-					rows = append(rows, kids...)
-					cursor = i
-				} else {
-					rows = append(rows, hit...)
-				}
-				units = append(units, unit{0, best, rows, cursor})
-				continue
-			}
-			if s, fp, o := composite(c.Label); o {
-				// Every word matched the repo label alone: a repo query
-				// written with spaces — show the whole group, cursor on it.
-				m.matches[i] = rowMatch{label: fp[0]}
-				units = append(units, unit{1, s, append([]int{i}, kids...), i})
-				continue
-			}
-			rows, best, cursor := []int{i}, 0, i
-			for _, w := range kids {
-				wc := m.cands[w]
-				if s, fp, o := composite(c.Label, wc.Label, wc.Branch); o {
-					m.matches[w] = rowMatch{label: fp[1], branch: fp[2]}
-					if _, seen := m.matches[i]; !seen && len(fp[0]) > 0 {
-						m.matches[i] = rowMatch{label: fp[0]}
-					}
-					rows = append(rows, w)
-					if s > best || cursor == i {
-						best, cursor = s, w
-					}
-				}
-			}
-			if cursor != i {
-				units = append(units, unit{1, best, rows, cursor})
-			}
-		case hop.KindWorktree: // orphan: no repo row to group under
-			if s, lp, bp, o := direct(c.Label, c.Branch); o {
-				m.matches[i] = rowMatch{label: lp, branch: bp}
-				units = append(units, unit{0, s, []int{i}, i})
-			} else if s, fp, o := composite(c.RepoLabel, c.Label, c.Branch); o {
-				m.matches[i] = rowMatch{label: fp[1], branch: fp[2]}
-				units = append(units, unit{1, s, []int{i}, i})
-			}
-		default:
-			if s, lp, _, o := direct(c.Label, ""); o {
-				m.matches[i] = rowMatch{label: lp}
-				units = append(units, unit{0, s, []int{i}, i})
-			} else if s, fp, o := composite(c.Label); o {
-				m.matches[i] = rowMatch{label: fp[0]}
-				units = append(units, unit{1, s, []int{i}, i})
+		score, lp, bp, ok := direct(c.Label, c.Branch)
+		mi := rowMatch{label: lp, branch: bp}
+		if c.Kind == hop.KindWorktree && c.RepoLabel != "" {
+			if rs, rp, rb, ro := direct(c.RepoLabel, c.Branch); ro && (!ok || rs >= score) {
+				score, ok, mi = rs, true, rowMatch{repo: rp, branch: rb}
 			}
 		}
-	}
-
-	sort.SliceStable(units, func(a, b int) bool {
-		if units[a].stage != units[b].stage {
-			return units[a].stage < units[b].stage
-		}
-		return units[a].score > units[b].score
-	})
-	var view []int
-	m.cursor = 0
-	for ui, u := range units {
-		for _, r := range u.rows {
-			if grouped[r] {
-				m.tree.child[r] = true
-			}
-			if ui == 0 && r == u.cursor {
-				m.cursor = len(view)
-			}
-			view = append(view, r)
-		}
-	}
-	m.view = view
-}
-
-// groupRows arranges forced matches (identity matches for a clone URL, the
-// checkout rows of a pull-request URL) the way buildFiltered arranges fuzzy
-// matches: a repository is followed by all its worktrees, a worktree is
-// preceded by its repository, each row emitted once in order of first
-// appearance. Synthetic rows (indexes past cands) pass through unchanged.
-func (m *HopModel) groupRows(idxs []int) []int {
-	_, children := m.groups()
-	parentOf := map[int]int{}
-	for p, ws := range children {
-		for _, w := range ws {
-			parentOf[w] = p
-		}
-	}
-	var out []int
-	seen := map[int]bool{}
-	add := func(r int) {
-		if !seen[r] {
-			seen[r] = true
-			out = append(out, r)
-		}
-	}
-	for _, r := range idxs {
-		if r >= len(m.cands) {
-			add(r)
+		if ok {
+			m.matches[i] = mi
+			rows = append(rows, scored{i, 0, score})
 			continue
 		}
-		switch m.cands[r].Kind {
-		case hop.KindRepo:
-			add(r)
-			for _, w := range children[r] {
-				m.tree.child[w] = true
-				add(w)
-			}
-		case hop.KindWorktree:
-			if p, ok := parentOf[r]; ok {
-				add(p)
-				m.tree.child[r] = true
-			}
-			add(r)
-		default:
-			add(r)
+		if score, pos, ok := composite(c.Label, c.Branch, c.RepoLabel); ok {
+			m.matches[i] = rowMatch{label: pos[0], branch: pos[1], repo: pos[2]}
+			rows = append(rows, scored{i, 1, score})
 		}
 	}
-	return out
+	sort.SliceStable(rows, func(a, b int) bool {
+		if rows[a].stage != rows[b].stage {
+			return rows[a].stage < rows[b].stage
+		}
+		return rows[a].score > rows[b].score
+	})
+	m.view = nil
+	m.cursor = 0
+	for _, row := range rows {
+		m.view = append(m.view, row.index)
+	}
 }
 
-// buildTree keeps the current group first, then ranks open groups by their
-// most urgent agent, including folded children. Ties retain section order.
-func (m *HopModel) buildTree() {
-	repoIdx, children := m.groups()
-	m.tree = treeState{active: true, foldable: true, child: map[int]bool{}, count: map[int]int{}}
+// buildList uses snapshot state so background worktree checks cannot move rows.
+func (m *HopModel) buildList() {
 	ranks := make([]int, len(m.cands))
+	visited := make([]int64, len(m.cands))
+	m.view = make([]int, len(m.cands))
 	for i, c := range m.cands {
+		m.view[i] = i
 		open := c.IsOpen()
 		if c.Kind == hop.KindWorktree {
-			// Snapshot counts stay fixed while background worktree states arrive.
 			open = c.OpenCount > 0
 		}
 		if open {
 			ranks[i] = 1 + hop.AgentStatusPriority(c.AgentStatus)
+			for _, id := range c.WorkspaceIDs {
+				visited[i] = max(visited[i], m.visits[id])
+			}
 		}
 	}
-	for p, ws := range children {
-		m.tree.count[p] = len(ws)
-		for _, w := range ws {
-			m.tree.child[w] = true
-			ranks[p] = max(ranks[p], ranks[w])
+	sort.SliceStable(m.view, func(a, b int) bool {
+		i, j := m.view[a], m.view[b]
+		if m.cands[i].Current != m.cands[j].Current {
+			return m.cands[i].Current
 		}
-		sort.SliceStable(ws, func(a, b int) bool { return ranks[ws[a]] > ranks[ws[b]] })
-	}
-
-	var heads []int
-	seen := map[int]bool{}
-	add := func(i int) {
-		if !seen[i] && !m.tree.child[i] {
-			seen[i] = true
-			heads = append(heads, i)
+		if ranks[i] != ranks[j] {
+			return ranks[i] > ranks[j]
 		}
-	}
-	// Preserve the existing repo/workspace/rest order when attention ranks tie.
-	for i, c := range m.cands {
-		if c.Kind == hop.KindRepo && c.IsOpen() {
-			add(i)
-		}
-	}
-	for i, c := range m.cands {
-		if c.Kind == hop.KindWorkspace {
-			add(i)
-		}
-	}
-	for i := range m.cands {
-		add(i)
-	}
-	pin, pinned := m.currentGroupParent(repoIdx)
-	sort.SliceStable(heads, func(a, b int) bool {
-		if pinned && (heads[a] == pin) != (heads[b] == pin) {
-			return heads[a] == pin
-		}
-		return ranks[heads[a]] > ranks[heads[b]]
+		return visited[i] > visited[j]
 	})
-	view := make([]int, 0, len(m.cands))
-	for _, i := range heads {
-		view = append(view, i)
-		if !m.collapsed[m.cands[i].Path] {
-			view = append(view, children[i]...)
-		}
-	}
-	m.view = view
 }
 
-// currentRepo is the repository the picker was invoked from, as a worktree
-// would be created from it: the current row's own effective root first (a
-// worktree knows its main checkout even when that checkout lies outside the
-// search paths and has no row of its own), then the group parent lookup,
-// which also covers a pane sitting in a subdirectory of a checkout.
+// currentRepo supplies the worktree creation shortcut's repository.
 func (m HopModel) currentRepo() (root, label string, ok bool) {
 	for _, c := range m.cands {
 		if c.Current {
-			if root, label, ok := c.EffectiveRoot(); ok {
-				return root, label, true
-			}
+			return m.worktreeRepoFor(c)
 		}
-	}
-	repoIdx, _ := m.groups()
-	if pin, ok := m.currentGroupParent(repoIdx); ok {
-		return m.cands[pin].Path, m.cands[pin].Label, true
 	}
 	return "", "", false
-}
-
-// currentGroupParent is the candidate index of the repository the picker was
-// invoked from: the herdr-focused workspace's row, mapped to itself for a
-// repository and to the main checkout for a worktree. A focused workspace
-// that is not itself a checkout row — typically because its pane sits in a
-// subdirectory of one — is mapped to the deepest repo or worktree candidate
-// containing its path (on path boundaries: /r/api must not claim
-// /r/api-old/sub).
-func (m HopModel) currentGroupParent(repoIdx map[string]int) (int, bool) {
-	cur := ""
-	for _, c := range m.cands {
-		if !c.Current {
-			continue
-		}
-		switch c.Kind {
-		case hop.KindRepo:
-			if i, ok := repoIdx[c.Path]; ok {
-				return i, true
-			}
-		case hop.KindWorktree:
-			if i, ok := repoIdx[c.RepoRoot]; ok {
-				return i, true
-			}
-		}
-		if c.Path != "" {
-			cur = c.Path
-		}
-	}
-	if cur == "" {
-		return 0, false
-	}
-	best, bestLen, found := 0, -1, false
-	for i, c := range m.cands {
-		if c.Kind != hop.KindRepo && c.Kind != hop.KindWorktree {
-			continue
-		}
-		if c.Path == "" || (cur != c.Path && !strings.HasPrefix(cur, c.Path+"/")) {
-			continue
-		}
-		if len(c.Path) <= bestLen {
-			continue
-		}
-		p := i
-		if c.Kind == hop.KindWorktree {
-			pi, ok := repoIdx[c.RepoRoot]
-			if !ok {
-				continue
-			}
-			p = pi
-		}
-		best, bestLen, found = p, len(c.Path), true
-	}
-	return best, found
-}
-
-// toggleGroup folds or unfolds the worktree group under the cursor (Tab).
-// While filtering it does nothing: the fold state must not be edited through
-// a view that does not show it.
-func (m *HopModel) toggleGroup() {
-	if !m.tree.foldable {
-		return
-	}
-	c, ok := m.selected()
-	if !ok {
-		return
-	}
-	idx := m.view[m.cursor] // candidate index under the cursor
-	var root string
-	switch {
-	case c.Kind == hop.KindRepo && m.tree.count[idx] > 0:
-		root = c.Path
-	case c.Kind == hop.KindWorktree && m.tree.child[idx]:
-		root = c.RepoRoot
-	}
-	if root == "" {
-		return
-	}
-	folding := !m.collapsed[root]
-	if folding {
-		m.collapsed[root] = true
-	} else {
-		delete(m.collapsed, root)
-	}
-	keep := idx
-	if folding && m.tree.child[idx] {
-		// The selected worktree is about to disappear: land on its repo.
-		for i, cc := range m.cands {
-			if cc.Kind == hop.KindRepo && cc.Path == root {
-				keep = i
-				break
-			}
-		}
-	}
-	m.buildTree()
-	m.cursorTo(keep)
 }
 
 // cursorTo puts the cursor on the row showing candidate index idx (the first
@@ -1721,6 +1394,10 @@ func (m HopModel) identityMatches(t clone.Target) []int {
 			out = append(out, i)
 		}
 	}
+	// A repository URL names the main checkout before its worktrees.
+	sort.SliceStable(out, func(a, b int) bool {
+		return m.cands[out[a]].Kind == hop.KindRepo && m.cands[out[b]].Kind != hop.KindRepo
+	})
 	return out
 }
 
@@ -1837,18 +1514,25 @@ func (m HopModel) waitCloneEvent() tea.Cmd {
 	return func() tea.Msg { return <-events }
 }
 
-// worktreeRepoFor returns the repository a worktree should be created from
-// for a row: the repo itself, or a worktree's main repository.
-func worktreeRepoFor(c hop.Candidate) (repo, label string, ok bool) {
-	switch c.Kind {
-	case hop.KindRepo:
-		return c.Path, c.Label, true
-	case hop.KindWorktree:
-		if c.RepoRoot != "" {
-			return c.RepoRoot, c.RepoLabel, true
+// worktreeRepoFor resolves standalone workspace directories to the deepest
+// containing checkout so worktree creation also works from a subdirectory.
+func (m HopModel) worktreeRepoFor(c hop.Candidate) (repo, label string, ok bool) {
+	if repo, label, ok := c.EffectiveRoot(); ok {
+		return repo, label, true
+	}
+	if c.Kind != hop.KindWorkspace || c.Path == "" {
+		return "", "", false
+	}
+	best := -1
+	for _, checkout := range m.cands {
+		if checkout.Path == "" || (c.Path != checkout.Path && !strings.HasPrefix(c.Path, checkout.Path+"/")) {
+			continue
+		}
+		if r, l, found := checkout.EffectiveRoot(); found && len(checkout.Path) > best {
+			repo, label, ok, best = r, l, true, len(checkout.Path)
 		}
 	}
-	return "", "", false
+	return repo, label, ok
 }
 
 // inputView renders a text input through the display boundary: a copy of
@@ -1954,11 +1638,11 @@ func (m HopModel) View() string {
 	}
 	writeln(sep)
 	hints := []keyHint{
-		{"enter", "open/switch/clone"}, {"tab", "fold"}, {"ctrl-t", "worktree"},
+		{"enter", "open/switch/clone"}, {"ctrl-t", "worktree"},
 		{"ctrl-n", "new workspace"}, {"ctrl-d", "delete worktree"}, {"ctrl-r", "reload"}, {"esc", "close"},
 	}
 	if m.worktreeMode {
-		hints = []keyHint{{"enter", "choose branch"}, {"tab", "fold"}, {"ctrl-d", "delete worktree"}, {"ctrl-r", "reload"}, {"esc", "close"}}
+		hints = []keyHint{{"enter", "choose branch"}, {"ctrl-d", "delete worktree"}, {"ctrl-r", "reload"}, {"esc", "close"}}
 	}
 	if m.confirm != nil {
 		hints = []keyHint{{"y", "delete the checkout (the branch is kept)"}, {"any other key", "keep it"}}

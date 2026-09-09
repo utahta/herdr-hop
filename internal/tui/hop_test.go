@@ -21,6 +21,7 @@ import (
 	"github.com/utahta/herdr-hop/internal/gitx"
 	"github.com/utahta/herdr-hop/internal/herdr"
 	"github.com/utahta/herdr-hop/internal/hop"
+	"github.com/utahta/herdr-hop/internal/recent"
 )
 
 type fakeClient struct {
@@ -597,104 +598,41 @@ func TestScrollWindowStableWhenHeaderGrows(t *testing.T) {
 	}
 }
 
-func TestTreeGroupingFoldingAndPin(t *testing.T) {
-	cands := []hop.Candidate{
-		{Kind: hop.KindRepo, Path: "/r/alpha", Label: "repoAL"},
-		{Kind: hop.KindRepo, Path: "/r/beta", Label: "repoBE"},
-		{Kind: hop.KindWorktree, Path: "/w/b1", Label: "wtBE1", Branch: "brONE", RepoRoot: "/r/beta", RepoLabel: "repoBE", Current: true},
-		{Kind: hop.KindWorktree, Path: "/w/b2", Label: "wtBE2", Branch: "brTWO", RepoRoot: "/r/beta", RepoLabel: "repoBE"},
-		{Kind: hop.KindWorktree, Path: "/w/orphan", Label: "wtORP", Branch: "brORP", RepoRoot: "/outside", RepoLabel: "outside"},
-		{Kind: hop.KindWorkspace, Path: "", Label: "wsSTD", OpenState: hop.OpenOpen, OpenWorkspaceID: "w9"},
+func TestFlatCurrentWorkspaceAndDirectNavigation(t *testing.T) {
+	m := newHopWith(t, []hop.Candidate{
+		{Kind: hop.KindRepo, Path: "/r/api", Label: "acme/api"},
+		{Kind: hop.KindWorktree, Path: "/w/current", Label: "current", Branch: "my-work", RepoRoot: "/r/api", RepoLabel: "acme/api", Current: true, OpenCount: 1, OpenState: hop.OpenOpen, OpenWorkspaceID: "w1"},
+		{Kind: hop.KindWorktree, Path: "/w/blocked", Label: "blocked", Branch: "fix-auth", RepoRoot: "/r/api", RepoLabel: "acme/api", OpenCount: 1, OpenState: hop.OpenOpen, OpenWorkspaceID: "w2", AgentStatus: "blocked"},
+	}, config.Config{})
+	if c, _ := m.selected(); c.Path != "/w/current" || m.cursor != 0 {
+		t.Fatalf("initial selection: %+v cursor=%d", c, m.cursor)
 	}
-	m := NewHop(config.Config{SearchPaths: []string{"/r"}}, &fakeClient{}, &fakeCloner{}, log.New(io.Discard, "", 0), false)
-	mm, _ := m.Update(loadedMsg{cands: cands, warn: nil, gen: 1, occupancy: hop.Occupancy{OK: true}})
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "acme/api  my-work  [current]") || !strings.Contains(view, "acme/api  fix-auth") || strings.Contains(view, "└─") || strings.Contains(view, "fold") {
+		t.Fatalf("flat rows: %s", view)
+	}
+	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	if mm.(HopModel).wt == nil || mm.(HopModel).wt.repo != "/r/api" || cmd == nil {
+		t.Fatal("current worktree must remain a worktree creation target")
+	}
+	mm, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
 	m = mm.(HopModel)
-	mm, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
-	m = mm.(HopModel)
-
-	labels := []string{"repoAL", "repoBE", "brONE", "brTWO", "brORP", "wsSTD"}
-	rows := func() (order []string, cursor string) {
-		for l := range strings.SplitSeq(m.View(), "\n") {
-			for _, lb := range labels {
-				if strings.Contains(l, lb) {
-					order = append(order, lb)
-					if strings.Contains(l, "> ") {
-						cursor = lb
-					}
-				}
-			}
-		}
-		return order, cursor
+	if c, _ := m.selected(); c.Path != "/w/blocked" {
+		t.Fatalf("one step must select blocked directly: %+v", c)
 	}
-	key := func(k tea.KeyType) {
-		mm, _ := m.Update(tea.KeyMsg{Type: k})
-		m = mm.(HopModel)
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter must focus the selected workspace")
 	}
-	expect := func(step string, wantCursor string, want ...string) {
-		t.Helper()
-		order, cursor := rows()
-		if strings.Join(order, " ") != strings.Join(want, " ") || cursor != wantCursor {
-			t.Fatalf("%s: order=%v cursor=%s (want %v cursor %s)\n%s", step, order, cursor, want, wantCursor, m.View())
-		}
+	if msg := cmd().(doneMsg); msg.err != nil {
+		t.Fatal(msg.err)
 	}
-
-	// The invoking worktree's repository group is pinned first; groups are
-	// expanded; the workspace section follows the open groups, the orphan
-	// worktree stays flat in the rest.
-	expect("initial", "repoBE", "repoBE", "brONE", "brTWO", "wsSTD", "repoAL", "brORP")
-	v := m.View()
-	if !strings.Contains(v, "- 2 worktrees") || !strings.Contains(v, "└─ brONE") || strings.Contains(v, "└─ brORP") {
-		t.Fatalf("markers:\n%s", v)
-	}
-
-	// Tab on the repo folds its group and keeps the cursor on it.
-	key(tea.KeyTab)
-	expect("fold", "repoBE", "repoBE", "wsSTD", "repoAL", "brORP")
-	if !strings.Contains(m.View(), "+ 2 worktrees") {
-		t.Fatalf("fold marker:\n%s", m.View())
-	}
-	// Tab again unfolds.
-	key(tea.KeyTab)
-	expect("unfold", "repoBE", "repoBE", "brONE", "brTWO", "wsSTD", "repoAL", "brORP")
-
-	// Tab on a child folds the group and lands on its repo.
-	key(tea.KeyDown)
-	key(tea.KeyTab)
-	expect("fold from child", "repoBE", "repoBE", "wsSTD", "repoAL", "brORP")
-
-	// Tab on rows without a group does nothing.
-	key(tea.KeyDown) // wsSTD: not a repo group
-	key(tea.KeyTab)
-	expect("tab on plain row", "wsSTD", "repoBE", "wsSTD", "repoAL", "brORP")
-
-	// A query switches to the grouped match list: the folded worktrees
-	// match directly (via their branches) and reappear under their repo,
-	// cursor on the best worktree; fold markers are not shown and Tab is a
-	// no-op.
-	for _, r := range "br" {
-		mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
-		m = mm.(HopModel)
-	}
-	expect("filtered", "brONE", "repoBE", "brONE", "brTWO", "brORP")
-	if !strings.Contains(m.View(), "└─ brONE") || strings.Contains(m.View(), "2 worktrees") {
-		t.Fatalf("filtered markers:\n%s", m.View())
-	}
-	before := m.View()
-	key(tea.KeyTab)
-	if m.View() != before {
-		t.Fatal("tab while filtering must not change anything")
-	}
-
-	// Clearing the query restores the tree with the fold state kept.
-	key(tea.KeyBackspace)
-	key(tea.KeyBackspace)
-	order, _ := rows()
-	if strings.Join(order, " ") != "repoBE wsSTD repoAL brORP" || !strings.Contains(m.View(), "+ 2 worktrees") {
-		t.Fatalf("restored: order=%v\n%s", order, m.View())
+	if calls := m.h.(*fakeClient).calls; len(calls) != 1 || calls[0] != "focus w2" {
+		t.Fatalf("navigation: %v", calls)
 	}
 }
 
-func TestFilterKeepsGroups(t *testing.T) {
+func TestFlatFilterMatchesDestinations(t *testing.T) {
 	cands := []hop.Candidate{
 		{Kind: hop.KindRepo, Path: "/r/alpha", Label: "acme/alpha"},
 		{Kind: hop.KindRepo, Path: "/r/big", Label: "acme/bigbroker"},
@@ -708,16 +646,16 @@ func TestFilterKeepsGroups(t *testing.T) {
 	mm, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
 	m = mm.(HopModel)
 
-	labels := []string{"acme/alpha", "acme/bigbroker", "fix-flaky", "feature-x", "fix-orphan"}
 	rows := func() (order []string, cursor string) {
-		for l := range strings.SplitSeq(m.View(), "\n") {
-			for _, lb := range labels {
-				if strings.Contains(l, lb) {
-					order = append(order, lb)
-					if strings.Contains(l, "> ") {
-						cursor = lb
-					}
-				}
+		for i := range m.view {
+			c, _ := m.rowAt(i)
+			name := c.Label
+			if c.Kind == hop.KindWorktree {
+				name = c.Branch
+			}
+			order = append(order, name)
+			if i == m.cursor {
+				cursor = name
 			}
 		}
 		return order, cursor
@@ -731,16 +669,15 @@ func TestFilterKeepsGroups(t *testing.T) {
 		q, cursor string
 		order     []string
 	}{
-		// repo name: the whole group, cursor on the repo.
+		// Repository names match each destination displaying that name.
 		{"bigbro", "acme/bigbroker", []string{"acme/bigbroker", "fix-flaky", "feature-x"}},
-		// branch name: the repo with the matching worktree, cursor on it.
-		{"flaky", "fix-flaky", []string{"acme/bigbroker", "fix-flaky"}},
+		// Branch queries return only the matching destination.
+		{"flaky", "fix-flaky", []string{"fix-flaky"}},
 		// repo + branch: composite AND across fields.
-		{"bigbro flaky", "fix-flaky", []string{"acme/bigbroker", "fix-flaky"}},
+		{"bigbro flaky", "fix-flaky", []string{"fix-flaky"}},
 		// word order must not matter.
-		{"flaky bigbro", "fix-flaky", []string{"acme/bigbroker", "fix-flaky"}},
-		// all words match the repo label alone: a repo query with spaces —
-		// whole group, cursor on the repo (not dragged onto a worktree).
+		{"flaky bigbro", "fix-flaky", []string{"fix-flaky"}},
+		// Multiple words can match a repository name.
 		{"acme big", "acme/bigbroker", []string{"acme/bigbroker", "fix-flaky", "feature-x"}},
 		// an orphan worktree is found through its RepoLabel.
 		{"outside orphan", "fix-orphan", []string{"fix-orphan"}},
@@ -978,7 +915,7 @@ func TestResolvingLineCountsAgainstViewport(t *testing.T) {
 	}
 }
 
-func TestTreeOpenReposFirst(t *testing.T) {
+func TestFlatOpenReposFirst(t *testing.T) {
 	// Worktrees absent from the snapshot must not move their groups when
 	// the background pass reports them open.
 	m := newHopWith(t, []hop.Candidate{
@@ -990,14 +927,14 @@ func TestTreeOpenReposFirst(t *testing.T) {
 		{Kind: hop.KindWorktree, Path: "/w/o", Label: "lblO", Branch: "wO", RepoRoot: "/x", RepoLabel: "x", OpenState: hop.OpenOpen, OpenWorkspaceID: "w3"},
 		{Kind: hop.KindWorkspace, Path: "", Label: "wsS", OpenState: hop.OpenOpen, OpenWorkspaceID: "w4"},
 	}, config.Config{SearchPaths: []string{"/r"}})
-	labels := []string{"rA", "rB", "rC", "rE", "wE", "wO", "wsS"}
 	var order []string
-	for l := range strings.SplitSeq(m.View(), "\n") {
-		for _, lb := range labels {
-			if strings.Contains(l, lb) {
-				order = append(order, lb)
-			}
+	for i := range m.view {
+		c, _ := m.rowAt(i)
+		name := c.Label
+		if c.Kind == hop.KindWorktree {
+			name = c.Branch
 		}
+		order = append(order, name)
 	}
 	want := "rC rB wsS rA rE wE wO" // current, open repos, workspaces, rest
 	if strings.Join(order, " ") != want {
@@ -1005,7 +942,59 @@ func TestTreeOpenReposFirst(t *testing.T) {
 	}
 }
 
-func TestTreeAgentPriority(t *testing.T) {
+func TestFlatHistoryBreaksStatusTies(t *testing.T) {
+	cands := []hop.Candidate{
+		{Kind: hop.KindRepo, Path: "/closed", Label: "closed", OpenState: hop.OpenClosed, WorkspaceIDs: []string{"closed"}},
+		{Kind: hop.KindRepo, Path: "/current", Label: "current", Current: true},
+		{Kind: hop.KindRepo, Path: "/old", Label: "old", OpenState: hop.OpenOpen, AgentStatus: "blocked", WorkspaceIDs: []string{"old"}},
+		{Kind: hop.KindWorktree, Path: "/new", Label: "new", OpenCount: 2, AgentStatus: "blocked", WorkspaceIDs: []string{"old", "new"}},
+		{Kind: hop.KindWorkspace, Label: "idle", OpenState: hop.OpenOpen, AgentStatus: "idle", WorkspaceIDs: []string{"idle"}},
+		{Kind: hop.KindWorkspace, Label: "unseen", OpenState: hop.OpenOpen, AgentStatus: "blocked", WorkspaceIDs: []string{"unseen"}},
+		{Kind: hop.KindWorkspace, Label: "tie", OpenState: hop.OpenOpen, AgentStatus: "blocked", WorkspaceIDs: []string{"tie"}},
+	}
+	m := newHopWith(t, cands, config.Config{})
+	m.visits = map[string]int64{"old": 100, "new": 200, "idle": 300, "closed": 400, "tie": 100}
+	m.buildList()
+	var labels []string
+	for _, idx := range m.view {
+		labels = append(labels, m.cands[idx].Label)
+	}
+	if got := strings.Join(labels, " "); got != "current new old tie unseen idle closed" {
+		t.Fatalf("history order: %s", got)
+	}
+}
+
+func TestLoadRecordsCurrentWorkspaceOnce(t *testing.T) {
+	history := recent.New(t.TempDir(), "session")
+	previous := time.Unix(100, 0)
+	if err := history.Record("current", previous); err != nil {
+		t.Fatal(err)
+	}
+	fc := &fakeClient{snap: herdr.Snapshot{Workspaces: []herdr.Workspace{
+		{ID: "current", Label: "current", Focused: true},
+		{ID: "other", Label: "other"},
+	}}}
+	m := NewHop(config.Config{}, fc, &fakeCloner{}, log.New(io.Discard, "", 0), false).WithHistory(history)
+	msg := m.load(1)().(loadedMsg)
+	if msg.visits["current"] != previous.UnixNano() {
+		t.Fatalf("loaded visits: %v", msg.visits)
+	}
+	mm, _ := m.Update(msg)
+	if c, _ := mm.(HopModel).selected(); !c.Current || c.OpenWorkspaceID != "current" {
+		t.Fatalf("initial workspace: %+v", c)
+	}
+	visits, err := history.Load([]string{"current", "other"})
+	if err != nil || visits["current"] <= previous.UnixNano() || visits["other"] != 0 {
+		t.Fatalf("observed current workspace: %v, %v", visits, err)
+	}
+	m.load(2)()
+	reloaded, err := history.Load([]string{"current"})
+	if err != nil || reloaded["current"] != visits["current"] {
+		t.Fatalf("reload recorded another visit: %v, %v", reloaded, err)
+	}
+}
+
+func TestFlatAgentPriority(t *testing.T) {
 	cands := []hop.Candidate{
 		{Kind: hop.KindRepo, Path: "/closed", Label: "closed"},
 		{Kind: hop.KindRepo, Path: "/idle", Label: "idle", OpenState: hop.OpenOpen, AgentStatus: "idle"},
@@ -1037,30 +1026,16 @@ func TestTreeAgentPriority(t *testing.T) {
 			t.Fatalf("order = %v, want %s", got, want)
 		}
 	}
-	want := "current wsBlocked group childBlocked childDone childWorking childWorking2 childIdle childUnknown childClosed orphanDone working idle wsIdle unknown wsFuture closed late"
+	want := "current childBlocked wsBlocked childDone orphanDone childWorking childWorking2 working idle childIdle wsIdle childUnknown unknown wsFuture closed group childClosed late"
 	expect(want)
-	if m.cands[3].AgentStatus != "" {
-		t.Fatal("group ranking must not change the parent's badge")
-	}
-	cursorOnPath(t, &m, "/group")
-	mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
-	m = mm.(HopModel)
-	expect("current wsBlocked group orphanDone working idle wsIdle unknown wsFuture closed late")
-	if c, _ := m.selected(); c.Path != "/group" {
-		t.Fatal("fold must keep the cursor on the parent")
-	}
-	mm, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
-	m = mm.(HopModel)
-	expect(want)
-
-	// Even a later tree rebuild must retain the snapshot-based order.
-	mm, _ = m.Update(wtStateMsg{gen: m.loadGen, states: hop.WorktreeStateResult{
+	// Rebuilding the list must retain the snapshot-based order.
+	mm, _ := m.Update(wtStateMsg{gen: m.loadGen, states: hop.WorktreeStateResult{
 		OK:   map[string]bool{"/group": true, "/outside": true},
 		Open: map[string]string{"/late": "late-ws", "/w/closed": "new-ws"},
 	}})
 	m = mm.(HopModel)
 	expect(want)
-	m.buildTree()
+	m.buildList()
 	expect(want)
 
 	m.input.SetValue("child")
@@ -1086,6 +1061,28 @@ func TestTreeAgentPriority(t *testing.T) {
 	m.input.SetValue("")
 	m.refilter()
 	expect(want)
+}
+
+func TestWorktreeRepositoryHighlightWinsPathTie(t *testing.T) {
+	const path = "/home/u/.herdr/worktrees/herdr-hop/feat"
+	m := newHopWith(t, []hop.Candidate{{
+		Kind: hop.KindWorktree, Path: path, Label: path, Branch: "feat",
+		RepoRoot: "/repo", RepoLabel: "utahta/herdr-hop",
+	}}, config.Config{})
+	m.input.SetValue("herdr-hop")
+	m.refilter()
+	if m.rowCount() != 1 {
+		t.Fatalf("expected the matching worktree, got %d rows", m.rowCount())
+	}
+	var highlighted strings.Builder
+	for _, seg := range m.rowSegs(0) {
+		if seg.style.GetForeground() == styleMatch.GetForeground() {
+			highlighted.WriteString(seg.text)
+		}
+	}
+	if got := highlighted.String(); got != "herdr-hop" {
+		t.Fatalf("repository highlight = %q, want herdr-hop", got)
+	}
 }
 
 func TestFilterRecordsMatchPositions(t *testing.T) {
@@ -1114,8 +1111,8 @@ func TestFilterRecordsMatchPositions(t *testing.T) {
 	}
 	// A composite query distributes words across rows and fields.
 	set("bigbro flaky")
-	if mi := m.matches[0]; len(mi.label) != 6 {
-		t.Fatalf("composite parent label: %+v", mi)
+	if mi := m.matches[1]; len(mi.repo) != 6 {
+		t.Fatalf("composite repository label: %+v", mi)
 	}
 	if mi := m.matches[1]; len(mi.branch) != 5 || len(mi.label) != 0 {
 		t.Fatalf("composite branch: %+v", mi)
@@ -1177,7 +1174,7 @@ func TestCounterRuleUnderInput(t *testing.T) {
 	}
 	// The hint line carries key chips and, like list rows, is clipped to the
 	// width (at 100 columns the tail hints are cut).
-	if !strings.Contains(lines[2], " enter ") || !strings.Contains(lines[2], " tab ") {
+	if !strings.Contains(lines[2], " enter ") || !strings.Contains(lines[2], " ctrl-t ") {
 		t.Fatalf("hints must carry key chips: %q", lines[2])
 	}
 	if lipgloss.Width(lines[2]) > 100 {
@@ -1323,20 +1320,18 @@ func newHopWith(t *testing.T, cands []hop.Candidate, cfg config.Config) HopModel
 	return mm.(HopModel)
 }
 
-func TestFilterCursorStaysOnRepoWhenItMatches(t *testing.T) {
-	// "api" matches the repo scattered (a-p-i) and the worktree label
-	// consecutively, so the worktree scores higher — but the user named the
-	// repo, and Enter must not open a worktree.
+func TestFlatFilterSelectsBestMatch(t *testing.T) {
+	// A direct destination match outranks a sparse repository-name match.
 	m := newHopWith(t, []hop.Candidate{
 		{Kind: hop.KindRepo, Path: "/r/api", Label: "acme/a-p-i"},
 		{Kind: hop.KindWorktree, Path: "/w/f", Label: "api-feature", Branch: "feat", RepoRoot: "/r/api", RepoLabel: "acme/a-p-i"},
 	}, config.Config{SearchPaths: []string{"/r"}})
 	m.input.SetValue("api")
 	m.refilter()
-	if c, ok := m.selected(); !ok || c.Kind != hop.KindRepo {
-		t.Fatalf("cursor must stay on the repo: %+v\n%s", c, m.View())
+	if c, ok := m.selected(); !ok || c.Kind != hop.KindWorktree {
+		t.Fatalf("cursor must select the best match: %+v\n%s", c, m.View())
 	}
-	if m.rowCount() != 2 { // the whole group is still shown
+	if m.rowCount() != 2 { // both destinations match
 		t.Fatalf("rows: %d\n%s", m.rowCount(), m.View())
 	}
 }
@@ -1399,10 +1394,8 @@ func TestWorktreeModeJumpsToCurrentRepo(t *testing.T) {
 	}
 }
 
-func TestPinFromSubdirectoryPane(t *testing.T) {
-	// The focused workspace's pane sits in a subdirectory of a checkout, so
-	// its row merges with nothing: the pin must map it to the containing
-	// repo, on path boundaries (/r/api must not claim /r/api-old/sub).
+func TestCurrentSubdirectoryWorkspaceCreatesWorktree(t *testing.T) {
+	// Workspace directories resolve on path boundaries for worktree creation.
 	cands := func(cur string) []hop.Candidate {
 		return []hop.Candidate{
 			{Kind: hop.KindRepo, Path: "/r/api", Label: "repoAPI"},
@@ -1415,15 +1408,18 @@ func TestPinFromSubdirectoryPane(t *testing.T) {
 		"/r/api/internal/srv": "repoAPI",
 	} {
 		m := newHopWith(t, cands(cur), config.Config{SearchPaths: []string{"/r"}})
-		if c, ok := m.rowAt(0); !ok || c.Label != want {
-			t.Errorf("cur=%s: first row %+v (want %s)\n%s", cur, c, want, m.View())
+		if c, ok := m.selected(); !ok || c.Path != cur || c.Kind != hop.KindWorkspace {
+			t.Fatalf("current workspace must be selected: %+v", c)
+		}
+		mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+		if wt := mm.(HopModel).wt; wt == nil || wt.label != want || cmd == nil {
+			t.Fatalf("cur=%s: worktree creation target %+v, want %s", cur, wt, want)
 		}
 	}
 }
 
-func TestCloneURLKeepsGroups(t *testing.T) {
-	// Pasting a clone URL of an existing checkout must show its group like
-	// a normal query would: repo first, worktree indented under it.
+func TestCloneURLKeepsFlatDestinations(t *testing.T) {
+	// A repository URL offers its existing checkouts without tree rendering.
 	m := newHopWith(t, []hop.Candidate{
 		{Kind: hop.KindWorktree, Path: "/w/f", Label: "wtR", Branch: "feat", RepoRoot: "/r/r", RepoLabel: "o/r", RepoID: "github.com/o/r"},
 		{Kind: hop.KindRepo, Path: "/r/r", Label: "o/r", RepoID: "github.com/o/r"},
@@ -1436,8 +1432,8 @@ func TestCloneURLKeepsGroups(t *testing.T) {
 	if first.Kind != hop.KindRepo || first.Path != "/r/r" || second.Path != "/w/f" || m.cursor != 0 {
 		t.Fatalf("rows: %+v / %+v cursor=%d\n%s", first, second, m.cursor, m.View())
 	}
-	if !strings.Contains(m.View(), "└─ feat") {
-		t.Fatalf("worktree must render as an indented child:\n%s", m.View())
+	if !strings.Contains(m.View(), "o/r  feat") || strings.Contains(m.View(), "└─") {
+		t.Fatalf("worktree must render independently:\n%s", m.View())
 	}
 }
 

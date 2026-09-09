@@ -31,6 +31,33 @@ func TestSnapshotParse(t *testing.T) {
 	}
 }
 
+func TestNavigationRecordsOnlySuccessfulFocus(t *testing.T) {
+	for _, success := range []bool{false, true} {
+		script := `echo '{"result":{"workspace":{"workspace_id":"created"}}}'`
+		if !success {
+			script = `echo '{"error":{"code":"failed","message":"failed"}}' >&2; exit 1`
+		}
+		var visits []string
+		c := &CLI{Bin: fakeBin(t, script), OnFocus: func(id string) { visits = append(visits, id) }}
+		for _, navigate := range []func() error{
+			func() error { return c.WorkspaceFocus("existing") },
+			func() error { return c.WorkspaceCreate("/repo", "repo") },
+			func() error { return c.WorktreeOpen("/repo", "/worktree") },
+			func() error { return c.WorktreeCreate("/repo", "feature", "main") },
+		} {
+			if err := navigate(); (err == nil) != success {
+				t.Fatalf("success=%v, err=%v", success, err)
+			}
+		}
+		if success && strings.Join(visits, " ") != "existing created created created" {
+			t.Fatalf("successful navigation: %v", visits)
+		}
+		if !success && len(visits) != 0 {
+			t.Fatalf("failed navigation recorded: %v", visits)
+		}
+	}
+}
+
 func TestErrorEnvelopeOnStderr(t *testing.T) {
 	// Real herdr: failure envelope goes to stderr, stdout is empty, exit 1.
 	c := &CLI{Bin: fakeBin(t, `echo '{"error":{"code":"workspace_not_found","message":"workspace wZ not found"},"id":"x"}' >&2; exit 1`)}

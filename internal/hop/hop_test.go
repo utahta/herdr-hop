@@ -102,6 +102,9 @@ func TestMerge(t *testing.T) {
 		t.Errorf("worktree: %+v", w)
 	}
 	b := byPath[repoB]
+	if strings.Join(b.WorkspaceIDs, " ") != "w2 w1" || strings.Join(w.WorkspaceIDs, " ") != "w7 w9" {
+		t.Fatalf("history must include all workspace matches: repo=%v worktree=%v", b.WorkspaceIDs, w.WorkspaceIDs)
+	}
 	if b.OpenWorkspaceID != "w1" || !b.IsOpen() || b.OpenCount != 2 {
 		t.Errorf("repoB should switch to lowest number: %+v", b)
 	}
