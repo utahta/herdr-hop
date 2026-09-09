@@ -156,6 +156,27 @@ func TestGroupKillerRaceDoneVsEscalate(t *testing.T) {
 	}
 }
 
+func TestCloneWaitDelayWithSurvivingHelper(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	bin := filepath.Join(dir, "git")
+	script := "#!/bin/sh\nsleep 300 &\necho $! > '" + pidFile + "'\necho 'Cloning...' >&2\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			_ = exec.Command("kill", "-9", strings.TrimSpace(string(b))).Run()
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), killGrace+5*time.Second)
+	defer cancel()
+	err := (&Git{Bin: bin}).Clone(ctx, "https://example.com/o/r", filepath.Join(dir, "d"), nil)
+	if err != nil {
+		t.Fatalf("successful clone with surviving helper: %v", err)
+	}
+}
+
 // TestCloneCancelKillsHelpers simulates git spawning a helper that keeps
 // stderr open (like ssh / git-remote-https). Cancelling must terminate both
 // processes and Clone must return promptly.
