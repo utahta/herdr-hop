@@ -52,11 +52,13 @@ var (
 	// violet, so the tree structure reads by hue: repositories stay in the
 	// default color, their worktrees hang below in this one. Hue only —
 	// weight is reserved for the cursor row.
-	styleBranch = lipgloss.NewStyle().Foreground(lipgloss.Color("139"))
-	styleErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	styleWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	styleOpen   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	styleKind   = map[hop.Kind]lipgloss.Style{
+	styleBranch  = lipgloss.NewStyle().Foreground(lipgloss.Color("139"))
+	styleErr     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	styleWarn    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	styleOpen    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	styleDone    = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	styleNoAgent = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleKind    = map[hop.Kind]lipgloss.Style{
 		hop.KindRepo:      lipgloss.NewStyle().Foreground(lipgloss.Color("4")),
 		hop.KindWorktree:  lipgloss.NewStyle().Foreground(lipgloss.Color("5")),
 		hop.KindWorkspace: lipgloss.NewStyle().Foreground(lipgloss.Color("6")),
@@ -464,18 +466,26 @@ func (m HopModel) rowSegs(i int) []rowSeg {
 	return segs
 }
 
-// badge is row i's open-state glyph, shown in its own column between the
-// left cell and the path: ● open (●N: N workspaces), ? state unknown.
-// OpenState says whether it is open (worktree list or snapshot); OpenCount
-// is only how many the snapshot confirmed, so a snapshot failure does not
-// hide a known-open row.
+// A known-open row keeps its badge even when the snapshot lacks agent status.
 func (m HopModel) badge(i int) (string, lipgloss.Style) {
 	c, _ := m.rowAt(i)
 	switch {
-	case c.OpenState == hop.OpenOpen && c.OpenCount > 1:
-		return fmt.Sprintf("●%d", c.OpenCount), styleOpen
 	case c.OpenState == hop.OpenOpen:
-		return "●", styleOpen
+		glyph, style := "·", styleNoAgent
+		switch c.AgentStatus {
+		case "working":
+			glyph, style = "●", styleWarn
+		case "blocked":
+			glyph, style = "●", styleErr
+		case "done":
+			glyph, style = "●", styleDone
+		case "idle":
+			glyph, style = "○", styleOpen
+		}
+		if c.OpenCount > 1 {
+			glyph = fmt.Sprintf("%s%d", glyph, c.OpenCount)
+		}
+		return glyph, style
 	case (c.Kind == hop.KindRepo || c.Kind == hop.KindWorktree) && c.OpenState == hop.OpenUnknown:
 		return "?", styleWarn
 	default:
@@ -1449,63 +1459,65 @@ func (m *HopModel) groupRows(idxs []int) []int {
 	return out
 }
 
-// buildTree fills view with the grouped empty-query rows: each repository is
-// followed by its scanned worktrees, indented, unless its group is folded;
-// the group of the repository the picker was invoked from comes first.
-// Worktrees whose main checkout is not among the candidates, and rows that
-// are not part of any group, keep their flat position.
+// buildTree keeps the current group first, then ranks open groups by their
+// most urgent agent, including folded children. Ties retain section order.
 func (m *HopModel) buildTree() {
 	repoIdx, children := m.groups()
 	m.tree = treeState{active: true, foldable: true, child: map[int]bool{}, count: map[int]int{}}
+	ranks := make([]int, len(m.cands))
+	for i, c := range m.cands {
+		open := c.IsOpen()
+		if c.Kind == hop.KindWorktree {
+			// Snapshot counts stay fixed while background worktree states arrive.
+			open = c.OpenCount > 0
+		}
+		if open {
+			ranks[i] = 1 + hop.AgentStatusPriority(c.AgentStatus)
+		}
+	}
 	for p, ws := range children {
 		m.tree.count[p] = len(ws)
 		for _, w := range ws {
 			m.tree.child[w] = true
+			ranks[p] = max(ranks[p], ranks[w])
 		}
+		sort.SliceStable(ws, func(a, b int) bool { return ranks[ws[a]] > ranks[ws[b]] })
 	}
 
-	view := make([]int, 0, len(m.cands))
+	var heads []int
 	seen := map[int]bool{}
-	emit := func(p int) { // a repo row and, unless folded, its children
-		if seen[p] {
-			return
-		}
-		seen[p] = true
-		view = append(view, p)
-		if !m.collapsed[m.cands[p].Path] {
-			view = append(view, children[p]...)
+	add := func(i int) {
+		if !seen[i] && !m.tree.child[i] {
+			seen[i] = true
+			heads = append(heads, i)
 		}
 	}
-	if pin, ok := m.currentGroupParent(repoIdx); ok {
-		emit(pin)
-	}
-	// Repositories open as a workspace, then the standalone workspace rows,
-	// come next: with the pinned current group they make the top of the
-	// list "what is open right now", which is the most likely hop target.
-	// Both open states are known at first paint (repo rows from the
-	// snapshot, workspace rows by definition). Orphan worktrees stay put
-	// even when open: their state is confirmed by a background pass after
-	// the first paint, and ordering by it would reshuffle the rows under
-	// the user.
+	// Preserve the existing repo/workspace/rest order when attention ranks tie.
 	for i, c := range m.cands {
 		if c.Kind == hop.KindRepo && c.IsOpen() {
-			emit(i)
+			add(i)
 		}
 	}
 	for i, c := range m.cands {
 		if c.Kind == hop.KindWorkspace {
-			seen[i] = true
-			view = append(view, i)
+			add(i)
 		}
 	}
-	for i, c := range m.cands {
-		switch {
-		case seen[i]: // already placed in an earlier section
-		case m.tree.child[i]: // shown under its repo (or hidden when folded)
-		case c.Kind == hop.KindRepo:
-			emit(i)
-		default:
-			view = append(view, i)
+	for i := range m.cands {
+		add(i)
+	}
+	pin, pinned := m.currentGroupParent(repoIdx)
+	sort.SliceStable(heads, func(a, b int) bool {
+		if pinned && (heads[a] == pin) != (heads[b] == pin) {
+			return heads[a] == pin
+		}
+		return ranks[heads[a]] > ranks[heads[b]]
+	})
+	view := make([]int, 0, len(m.cands))
+	for _, i := range heads {
+		view = append(view, i)
+		if !m.collapsed[m.cands[i].Path] {
+			view = append(view, children[i]...)
 		}
 	}
 	m.view = view

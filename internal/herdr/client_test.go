@@ -18,12 +18,12 @@ func fakeBin(t *testing.T, script string) string {
 }
 
 func TestSnapshotParse(t *testing.T) {
-	c := &CLI{Bin: fakeBin(t, `echo '{"id":"x","result":{"snapshot":{"workspaces":[{"workspace_id":"w1","label":"a","number":1,"active_tab_id":"w1:t1","worktree":{"checkout_path":"/p","repo_root":"/r","is_linked_worktree":true}}],"layouts":[{"tab_id":"w1:t1","workspace_id":"w1","focused_pane_id":"w1:p1"}],"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":null,"foreground_cwd":"/f"}]}}}'`)}
+	c := &CLI{Bin: fakeBin(t, `echo '{"id":"x","result":{"snapshot":{"workspaces":[{"workspace_id":"w1","label":"a","number":1,"active_tab_id":"w1:t1","agent_status":"blocked","worktree":{"checkout_path":"/p","repo_root":"/r","is_linked_worktree":true}}],"layouts":[{"tab_id":"w1:t1","workspace_id":"w1","focused_pane_id":"w1:p1"}],"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":null,"foreground_cwd":"/f"}]}}}'`)}
 	s, err := c.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Workspaces) != 1 || s.Workspaces[0].Worktree == nil || s.Workspaces[0].Worktree.CheckoutPath != "/p" {
+	if len(s.Workspaces) != 1 || s.Workspaces[0].Worktree == nil || s.Workspaces[0].Worktree.CheckoutPath != "/p" || s.Workspaces[0].AgentStatus != "blocked" {
 		t.Errorf("bad workspaces: %+v", s.Workspaces)
 	}
 	if s.Panes[0].Cwd != nil || *s.Panes[0].ForegroundCwd != "/f" {

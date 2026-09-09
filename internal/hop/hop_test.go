@@ -17,6 +17,36 @@ import (
 
 //go:fix inline
 
+func TestMergeAgentStatus(t *testing.T) {
+	for _, statuses := range [][]string{
+		{"idle", "unknown"}, {"working", "idle"}, {"done", "working"},
+		{"blocked", "done"}, {"working", "future_status"}, {"idle", ""},
+	} {
+		for _, reverse := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/%s/reverse=%v", statuses[0], statuses[1], reverse), func(t *testing.T) {
+				workspaces := []herdr.Workspace{
+					{ID: "w1", Number: 1, AgentStatus: statuses[0], Worktree: &herdr.WorkspaceWorktree{CheckoutPath: "/repo"}},
+					{ID: "w2", Number: 2, AgentStatus: statuses[1], Worktree: &herdr.WorkspaceWorktree{CheckoutPath: "/repo"}},
+				}
+				if reverse {
+					workspaces[0], workspaces[1] = workspaces[1], workspaces[0]
+				}
+				for _, linked := range []bool{false, true} {
+					got := Merge([]scan.Repo{{Path: "/repo"}}, []gitx.WorktreeListing{{RepoRoot: "/parent", Worktrees: []gitx.WorktreeEntry{{Path: "/repo", IsLinked: linked}}}}, nil, &herdr.Snapshot{Workspaces: workspaces}, nil)
+					if len(got) != 1 || got[0].AgentStatus != statuses[0] || got[0].OpenCount != 2 || got[0].OpenWorkspaceID != "w1" {
+						t.Fatalf("linked=%v: %+v", linked, got)
+					}
+				}
+			})
+		}
+	}
+	snap := &herdr.Snapshot{Workspaces: []herdr.Workspace{{ID: "orphan", AgentStatus: "done"}}}
+	got := Merge(nil, nil, nil, snap, nil)
+	if len(got) != 1 || got[0].AgentStatus != "done" || got[0].Kind != KindWorkspace {
+		t.Fatalf("standalone workspace: %+v", got)
+	}
+}
+
 func TestMerge(t *testing.T) {
 	root := scan.Normalize(t.TempDir())
 	repoA := filepath.Join(root, "github.com/o/a")
