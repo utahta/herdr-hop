@@ -459,7 +459,7 @@ func Merge(repos []scan.Repo, worktrees []gitx.WorktreeListing, failed map[strin
 			if p != "" {
 				if row, ok := byPath[p]; ok && row.Kind != KindUnknown {
 					matches[p] = append(matches[p], wsMatch{ws.ID, ws.Number, ws.Worktree != nil})
-					if agentStatusPriority(ws.AgentStatus) > agentStatusPriority(row.AgentStatus) {
+					if AgentStatusPriority(ws.AgentStatus) > AgentStatusPriority(row.AgentStatus) {
 						row.AgentStatus = ws.AgentStatus
 					}
 					if ws.Focused {
@@ -583,8 +583,8 @@ func ApplyWorktreeStates(cands []Candidate, st WorktreeStateResult) {
 	}
 }
 
-// Match herdr's workspace attention order, including unacknowledged completion.
-func agentStatusPriority(status string) int {
+// AgentStatusPriority follows herdr's attention order. Unknown states rank last.
+func AgentStatusPriority(status string) int {
 	switch status {
 	case "blocked":
 		return 4

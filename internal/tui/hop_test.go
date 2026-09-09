@@ -979,11 +979,8 @@ func TestResolvingLineCountsAgainstViewport(t *testing.T) {
 }
 
 func TestTreeOpenReposFirst(t *testing.T) {
-	// With an empty query the top of the list is "what is open right now":
-	// the pinned current group, repo groups open as a workspace, then the
-	// standalone workspace rows. An orphan worktree stays put even when
-	// open (its state arrives after the first paint), and an open worktree
-	// must not lift its closed repository.
+	// Worktrees absent from the snapshot must not move their groups when
+	// the background pass reports them open.
 	m := newHopWith(t, []hop.Candidate{
 		{Kind: hop.KindRepo, Path: "/r/a", Label: "rA", OpenState: hop.OpenClosed},
 		{Kind: hop.KindRepo, Path: "/r/b", Label: "rB", OpenState: hop.OpenOpen, OpenWorkspaceID: "w1"},
@@ -1006,6 +1003,89 @@ func TestTreeOpenReposFirst(t *testing.T) {
 	if strings.Join(order, " ") != want {
 		t.Fatalf("order=%v (want %s)\n%s", order, want, m.View())
 	}
+}
+
+func TestTreeAgentPriority(t *testing.T) {
+	cands := []hop.Candidate{
+		{Kind: hop.KindRepo, Path: "/closed", Label: "closed"},
+		{Kind: hop.KindRepo, Path: "/idle", Label: "idle", OpenState: hop.OpenOpen, AgentStatus: "idle"},
+		{Kind: hop.KindRepo, Path: "/current", Label: "current", Current: true},
+		{Kind: hop.KindRepo, Path: "/group", Label: "group", OpenState: hop.OpenClosed},
+		{Kind: hop.KindWorktree, Path: "/w/closed", Label: "childClosed", RepoRoot: "/group"},
+		{Kind: hop.KindWorktree, Path: "/w/working", Label: "childWorking", RepoRoot: "/group", OpenCount: 1, AgentStatus: "working"},
+		{Kind: hop.KindWorktree, Path: "/w/blocked", Label: "childBlocked", RepoRoot: "/group", OpenCount: 1, AgentStatus: "blocked"},
+		{Kind: hop.KindWorktree, Path: "/w/done", Label: "childDone", RepoRoot: "/group", OpenCount: 1, AgentStatus: "done"},
+		{Kind: hop.KindWorktree, Path: "/w/idle", Label: "childIdle", RepoRoot: "/group", OpenCount: 1, AgentStatus: "idle"},
+		{Kind: hop.KindWorktree, Path: "/w/unknown", Label: "childUnknown", RepoRoot: "/group", OpenCount: 1},
+		{Kind: hop.KindWorktree, Path: "/w/working2", Label: "childWorking2", RepoRoot: "/group", OpenCount: 1, AgentStatus: "working"},
+		{Kind: hop.KindWorkspace, Label: "wsBlocked", OpenState: hop.OpenOpen, AgentStatus: "blocked"},
+		{Kind: hop.KindRepo, Path: "/working", Label: "working", OpenState: hop.OpenOpen, AgentStatus: "working"},
+		{Kind: hop.KindWorktree, Path: "/orphan", Label: "orphanDone", RepoRoot: "/outside", OpenCount: 1, AgentStatus: "done"},
+		{Kind: hop.KindRepo, Path: "/unknown", Label: "unknown", OpenState: hop.OpenOpen},
+		{Kind: hop.KindWorkspace, Label: "wsIdle", OpenState: hop.OpenOpen, AgentStatus: "idle"},
+		{Kind: hop.KindWorkspace, Label: "wsFuture", OpenState: hop.OpenOpen, AgentStatus: "future_status"},
+		{Kind: hop.KindWorktree, Path: "/late", Label: "late", RepoRoot: "/outside"},
+	}
+	m := newHopWith(t, cands, config.Config{})
+	expect := func(want string) {
+		t.Helper()
+		var got []string
+		for _, i := range m.view {
+			got = append(got, m.cands[i].Label)
+		}
+		if strings.Join(got, " ") != want {
+			t.Fatalf("order = %v, want %s", got, want)
+		}
+	}
+	want := "current wsBlocked group childBlocked childDone childWorking childWorking2 childIdle childUnknown childClosed orphanDone working idle wsIdle unknown wsFuture closed late"
+	expect(want)
+	if m.cands[3].AgentStatus != "" {
+		t.Fatal("group ranking must not change the parent's badge")
+	}
+	cursorOnPath(t, &m, "/group")
+	mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = mm.(HopModel)
+	expect("current wsBlocked group orphanDone working idle wsIdle unknown wsFuture closed late")
+	if c, _ := m.selected(); c.Path != "/group" {
+		t.Fatal("fold must keep the cursor on the parent")
+	}
+	mm, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = mm.(HopModel)
+	expect(want)
+
+	// Even a later tree rebuild must retain the snapshot-based order.
+	mm, _ = m.Update(wtStateMsg{gen: m.loadGen, states: hop.WorktreeStateResult{
+		OK:   map[string]bool{"/group": true, "/outside": true},
+		Open: map[string]string{"/late": "late-ws", "/w/closed": "new-ws"},
+	}})
+	m = mm.(HopModel)
+	expect(want)
+	m.buildTree()
+	expect(want)
+
+	m.input.SetValue("child")
+	m.refilter()
+	var searched []string
+	for _, i := range m.view {
+		searched = append(searched, m.cands[i].Label)
+	}
+	baselineCands := append([]hop.Candidate(nil), cands...)
+	for i := range baselineCands {
+		baselineCands[i].AgentStatus = ""
+	}
+	baseline := newHopWith(t, baselineCands, config.Config{})
+	baseline.input.SetValue("child")
+	baseline.refilter()
+	var baselineLabels []string
+	for _, i := range baseline.view {
+		baselineLabels = append(baselineLabels, baseline.cands[i].Label)
+	}
+	if strings.Join(searched, " ") != strings.Join(baselineLabels, " ") {
+		t.Fatalf("agent state changed search order: %v vs %v", searched, baselineLabels)
+	}
+	m.input.SetValue("")
+	m.refilter()
+	expect(want)
 }
 
 func TestFilterRecordsMatchPositions(t *testing.T) {
