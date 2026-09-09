@@ -35,6 +35,8 @@ type Client interface {
 // CLI runs the herdr binary.
 type CLI struct {
 	Bin string
+	// OnFocus records successful navigation without another snapshot request.
+	OnFocus func(workspaceID string)
 }
 
 // NewCLI uses $HERDR_BIN_PATH, falling back to "herdr" on PATH.
@@ -116,18 +118,19 @@ func (c *CLI) WorkspaceCreate(cwd, label string) error {
 	if label != "" {
 		args = append(args, "--label", label)
 	}
-	_, err := c.run(args...)
-	return err
+	return c.runOpening(args...)
 }
 
 func (c *CLI) WorkspaceFocus(id string) error {
 	_, err := c.run("workspace", "focus", id)
+	if err == nil && c.OnFocus != nil {
+		c.OnFocus(id)
+	}
 	return err
 }
 
 func (c *CLI) WorktreeOpen(repoRoot, path string) error {
-	_, err := c.run("worktree", "open", "--cwd", repoRoot, "--path", path, "--focus")
-	return err
+	return c.runOpening("worktree", "open", "--cwd", repoRoot, "--path", path, "--focus")
 }
 
 func (c *CLI) WorktreeCreate(repo, branch, base string) error {
@@ -135,7 +138,19 @@ func (c *CLI) WorktreeCreate(repo, branch, base string) error {
 	if base != "" {
 		args = append(args, "--base", base)
 	}
-	_, err := c.run(args...)
+	return c.runOpening(args...)
+}
+
+func (c *CLI) runOpening(args ...string) error {
+	raw, err := c.run(args...)
+	if err == nil && c.OnFocus != nil {
+		var result struct {
+			Workspace Workspace `json:"workspace"`
+		}
+		if json.Unmarshal(raw, &result) == nil && result.Workspace.ID != "" {
+			c.OnFocus(result.Workspace.ID)
+		}
+	}
 	return err
 }
 

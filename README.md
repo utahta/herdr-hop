@@ -2,15 +2,7 @@
 
 A [herdr](https://herdr.dev) plugin for getting to a repository fast: fuzzy-pick a repository, a git worktree, or an already-open workspace and hop to it; type a repository you don't have yet and clone it; pick a branch and open it as a new worktree. One popup.
 
-```
-hop> utahta/herdr
- 4/180 ────────────────────────────────────────────────────────
- enter  open/switch/clone   tab  fold   ctrl-t  worktree  …
-> utahta/herdr-hop           ●   ~/src/github.com/utahta/herdr-hop
-  └─ feat                    ●   ~/.herdr/worktrees/herdr-hop/feat
-  utahta/herdr-prompt.nvim       ~/src/github.com/utahta/herdr-prompt.nvim
-  utahta/herdr-new  clone  https://github.com/utahta/herdr-new.git
-```
+![Hop popup showing repositories, worktrees, and the current workspace](https://github.com/user-attachments/assets/f7c5399e-a618-42b8-9656-f5ce62e16101)
 
 ## What it does
 
@@ -100,15 +92,16 @@ Without a key you can still run `herdr plugin action invoke utahta.hop.open`.
 
 ### The picker (`prefix+f`)
 
-Type to filter; the matched characters light up. Repository and worktree rows read as such from the tree structure; anything else (`workspace`, `clone`, `pull`, …) carries a dim kind tag after its label. The glyph column before the path shows open workspaces using herdr's agent indicators: a muted `·` for no known agent state, yellow `●` for working, red `●` for blocked, teal `●` for done (not yet acknowledged), and green `○` for idle. A suffix counts matching workspaces (`●2`: two of them); their status is combined in the order blocked, done, working, idle, unknown. Closed rows have no glyph; `?` means the open state could not be read. Agent status comes from the existing snapshot and updates when the picker opens or reloads with `ctrl-r`.
+Type to filter; the matched characters light up. Every destination has its own flat row; worktrees display their repository name alongside the branch, and anything else (`workspace`, `clone`, `pull`, …) carries a dim kind tag after its label. The glyph column before the path shows open workspaces using herdr's agent indicators: a muted `·` for no known agent state, yellow `●` for working, red `●` for blocked, teal `●` for done (not yet acknowledged), and green `○` for idle. A suffix counts matching workspaces (`●2`: two of them); their status is combined in the order blocked, done, working, idle, unknown. Closed rows have no glyph; `?` means the open state could not be read. Agent status comes from the existing snapshot and updates when the picker opens or reloads with `ctrl-r`.
 
-Worktrees are grouped under their repository (`- 2 worktrees`, indented `└─` rows); while the query is empty the repository you invoked the picker from comes first, followed by open groups and standalone workspaces in agent-priority order (blocked, done, working, idle, unknown), then the remaining entries. A group uses the highest priority of its repository and worktrees, even when folded; its worktrees are also ordered with open entries first, then by agent priority. Equal priorities preserve the previous order. Ordering uses the opening snapshot, so background worktree-state updates do not reshuffle the list. `tab` folds or unfolds the selected group. Typing keeps the grouping but ignores the fold state, so folded worktrees always stay reachable: a repository match brings all its worktrees, a worktree or branch match brings its repository, and a multi-word query like `myrepo mybranch` (in either order) narrows a repository down to the matching worktree. Clearing the query brings the fold state back.
+With an empty query, the current workspace is first and marked `[current]`, with the initial cursor on it. Other open destinations follow in agent-priority order (blocked, done, working, idle, unknown); within the same status, the most recently visited comes first. Remaining ties keep candidate order, and unopened destinations follow. Ordering uses the opening snapshot, so background worktree-state updates do not reshuffle the list. Search ranks each destination by relevance: repository names match their checkout rows, and a multi-word query like `myrepo mybranch` (in either order) finds the matching worktree directly. There are no parent headings or folded rows to navigate past.
+
+Hop records the current workspace when the picker opens and records successful workspace switches and workspace/worktree creation through hop. History is scoped to the herdr connection and stored under `$HERDR_PLUGIN_STATE_DIR/recent`; if the state directory is unset, history is disabled. A row representing several workspaces uses their most recent visit. Switching outside hop is only observed when hop is opened there, so this is hop's visit history rather than a complete record of herdr activity. History read/write failures are logged and do not prevent navigation. No polling or extra herdr requests are needed.
 
 | Key | Action |
 |---|---|
 | `enter` | Open the repository as a workspace, switch to it if it is open, open the worktree, or clone (on a `clone` row) |
-| `tab` | Fold / unfold the selected repository's worktree group (empty query only) |
-| `ctrl-t` | Create a worktree from the selected repository (or the selected worktree's repository) |
+| `ctrl-t` | Create a worktree from the selected checkout's repository, including a workspace in its subdirectory |
 | `ctrl-n` | Create a new workspace even if one is already open (repository rows only) |
 | `ctrl-d` | Delete the selected worktree's checkout, after a `y` (worktree rows only; the branch is kept) |
 | `ctrl-r` | Rescan |
@@ -164,8 +157,7 @@ go test -race ./...
 go build -o herdr-hop . && herdr plugin link "$PWD"
 ```
 
-`herdr-hop tui --mode hop|worktree` is what the popup runs; `herdr-hop open
---mode …` is what the actions run to open that popup.
+`herdr-hop tui --mode hop|worktree` is what the popup runs; `herdr-hop open --mode …` is what the actions run to open that popup.
 
 ## License
 

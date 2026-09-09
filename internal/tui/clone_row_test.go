@@ -297,7 +297,7 @@ func TestPickerLabelsAreSanitizedForDisplay(t *testing.T) {
 			t.Errorf("%q reached the view: %q", bad, v)
 		}
 	}
-	if !strings.Contains(v, "github.com/o/a") || !strings.Contains(v, "└─ feat") {
+	if !strings.Contains(v, "github.com/o/a") || !strings.Contains(v, "feat") {
 		t.Errorf("text lost:\n%s", v)
 	}
 	mm, _ := m.Update(doneMsg{err: errors.New("herdr: \x1b[2Jbad \x1b]0;t\x07path")})

@@ -107,6 +107,8 @@ type Candidate struct {
 	OpenWorkspaceID string
 	// OpenCount is the number of workspaces matching this row's path (badge only).
 	OpenCount int
+	// WorkspaceIDs are the snapshot matches used to look up hop visit history.
+	WorkspaceIDs []string
 	// AgentStatus is the highest-priority status of the path-matching workspaces.
 	AgentStatus string
 	// RepoID is "host/owner/repo" (lower-cased) derived from the origin remote,
@@ -299,7 +301,8 @@ func Build(h Lister, g WorktreeLister, targets []scan.Target, searchPaths []stri
 // are unknown (they read as false and 0), which matters to anything that
 // must not act on a row someone is using — see CanRemove.
 type Loaded struct {
-	Cands []Candidate
+	Cands              []Candidate
+	CurrentWorkspaceID string
 	// Occupancy is where herdr's panes are (OccupancyOf the snapshot), for
 	// the checks that must not act on a directory someone is using.
 	Occupancy Occupancy
@@ -373,6 +376,14 @@ func Load(h Lister, g WorktreeLister, targets []scan.Target, searchPaths []strin
 		snap = nil
 	}
 	out := Loaded{Cands: Merge(repos, worktrees, failed, snap, searchPaths), Occupancy: OccupancyOf(snap)}
+	if snap != nil {
+		for _, ws := range snap.Workspaces {
+			if ws.Focused {
+				out.CurrentWorkspaceID = ws.ID
+				break
+			}
+		}
+	}
 	if len(errs) > 0 {
 		return out, fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
@@ -459,6 +470,7 @@ func Merge(repos []scan.Repo, worktrees []gitx.WorktreeListing, failed map[strin
 			if p != "" {
 				if row, ok := byPath[p]; ok && row.Kind != KindUnknown {
 					matches[p] = append(matches[p], wsMatch{ws.ID, ws.Number, ws.Worktree != nil})
+					row.WorkspaceIDs = append(row.WorkspaceIDs, ws.ID)
 					if AgentStatusPriority(ws.AgentStatus) > AgentStatusPriority(row.AgentStatus) {
 						row.AgentStatus = ws.AgentStatus
 					}
@@ -471,7 +483,8 @@ func Merge(repos []scan.Repo, worktrees []gitx.WorktreeListing, failed map[strin
 			standalone = append(standalone, Candidate{
 				Kind: KindWorkspace, Path: p, Label: workspaceLabel(ws, p, searchPaths),
 				OpenState: OpenOpen, OpenWorkspaceID: ws.ID, OpenCount: 1, Current: ws.Focused,
-				AgentStatus: ws.AgentStatus,
+				AgentStatus:  ws.AgentStatus,
+				WorkspaceIDs: []string{ws.ID},
 			})
 		}
 		for p, ms := range matches {
