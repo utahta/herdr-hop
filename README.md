@@ -2,15 +2,7 @@
 
 A [herdr](https://herdr.dev) plugin for getting to a repository fast: fuzzy-pick a repository, a git worktree, or an already-open workspace and hop to it; type a repository you don't have yet and clone it; pick a branch and open it as a new worktree. One popup.
 
-```
-hop> utahta/herdr
- 4/180 ────────────────────────────────────────────────────────
- enter  open/switch/clone   ctrl-t  worktree  …
-> utahta/herdr-hop  feat  [current]  ○   ~/.herdr/worktrees/herdr-hop/feat
-  utahta/herdr-hop                   ·   ~/src/github.com/utahta/herdr-hop
-  utahta/herdr-prompt.nvim       ~/src/github.com/utahta/herdr-prompt.nvim
-  utahta/herdr-new  clone  https://github.com/utahta/herdr-new.git
-```
+![Hop popup showing repositories, worktrees, and the current workspace](https://github.com/user-attachments/assets/f7c5399e-a618-42b8-9656-f5ce62e16101)
 
 ## What it does
 
@@ -165,8 +157,7 @@ go test -race ./...
 go build -o herdr-hop . && herdr plugin link "$PWD"
 ```
 
-`herdr-hop tui --mode hop|worktree` is what the popup runs; `herdr-hop open
---mode …` is what the actions run to open that popup.
+`herdr-hop tui --mode hop|worktree` is what the popup runs; `herdr-hop open --mode …` is what the actions run to open that popup.
 
 ## License
 
