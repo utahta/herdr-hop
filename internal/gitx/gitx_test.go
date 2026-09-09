@@ -607,6 +607,30 @@ func TestCloneDrainsHugeStderr(t *testing.T) {
 	}
 }
 
+func TestCloneDrainsStderrWithSlowProgress(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "git")
+	script := "#!/bin/sh\ni=0\nwhile [ $i -lt 1000 ]; do\n" +
+		"printf 'line %04d\\n' \"$i\" >&2\ni=$((i + 1))\ndone\nexit 128\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	err := (&Git{Bin: bin}).Clone(context.Background(), "https://example.com/o/r", filepath.Join(dir, "d"), func(line string) {
+		if len(lines) == 0 {
+			// Let git exit while stderr still contains unread lines.
+			time.Sleep(200 * time.Millisecond)
+		}
+		lines = append(lines, line)
+	})
+	if len(lines) != 1000 {
+		t.Errorf("want 1000 progress lines, got %d", len(lines))
+	}
+	if err == nil || !strings.Contains(err.Error(), "line 0999") {
+		t.Errorf("missing final diagnostic: %v", err)
+	}
+}
+
 func TestProgressLinesSplitting(t *testing.T) {
 	var got []string
 	for l := range progressLines(strings.NewReader("a\rb\nc\r\nd")) {

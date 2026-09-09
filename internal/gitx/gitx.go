@@ -532,10 +532,12 @@ func (g *Git) SetUpstream(repo, branch, upstream string) error {
 func (g *Git) Clone(ctx context.Context, url, dest string, progress func(line string)) error {
 	cmd := exec.CommandContext(ctx, g.Bin, "clone", "--progress", url, dest)
 	killer := setupProcessGroup(cmd)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
+	stderr, stderrWriter := io.Pipe()
+	defer stderr.Close()
+	defer stderrWriter.Close()
+	// A Writer makes Wait drain stderr before returning; WaitDelay still
+	// bounds the wait if a helper keeps the process pipe open.
+	cmd.Stderr = stderrWriter
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("git clone: %w", err)
 	}
@@ -546,12 +548,7 @@ func (g *Git) Clone(ctx context.Context, url, dest string, progress func(line st
 		sanitizedMask := clone.NewMasker(su)
 		mask = func(s string) string { return sanitizedMask(raw(s)) }
 	}
-	// Read stderr concurrently so that Wait (which enforces WaitDelay and
-	// closes the pipe) is never blocked behind the reader. The pipe is always
-	// drained to EOF: if the reader stopped early, a helper writing a lot of
-	// stderr would block on a full pipe and never exit, and Clone would hang.
-	// Lines are read as bounded fragments (progressLineLimit) so that an
-	// unbounded line cannot grow memory; the excess is discarded.
+	// Bound each progress line so oversized diagnostics cannot grow memory.
 	var last []string
 	readDone := make(chan struct{})
 	go func() {
@@ -575,6 +572,7 @@ func (g *Git) Clone(ctx context.Context, url, dest string, progress func(line st
 	}()
 
 	waitErr := cmd.Wait()
+	stderrWriter.Close()
 	// The git leader is reaped, but helpers may remain in the process group.
 	// groupKiller.done keeps escalation active while the group still exists
 	// and only stands down once the whole group has gone.
@@ -583,7 +581,8 @@ func (g *Git) Clone(ctx context.Context, url, dest string, progress func(line st
 	if ctx.Err() != nil {
 		return fmt.Errorf("git clone: %w", ctx.Err())
 	}
-	if waitErr != nil {
+	// ErrWaitDelay does not change git's successful exit status.
+	if waitErr != nil && !errors.Is(waitErr, exec.ErrWaitDelay) {
 		return fmt.Errorf("git clone: %w: %s", waitErr, strings.Join(last, " | "))
 	}
 	return nil
