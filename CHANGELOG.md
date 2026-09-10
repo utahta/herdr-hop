@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.4.0](https://github.com/utahta/herdr-hop/compare/v0.3.1...v0.4.0) - 2026-09-10
+
+- Prioritize visit history across idle and unknown workspaces by @utahta in https://github.com/utahta/herdr-hop/pull/9
+
 ## [v0.3.1](https://github.com/utahta/herdr-hop/compare/v0.3.0...v0.3.1) - 2026-09-09
 
 - Fix clone stderr loss when Git exits before progress is drained by @utahta in https://github.com/utahta/herdr-hop/pull/7
