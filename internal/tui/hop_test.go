@@ -964,6 +964,40 @@ func TestFlatHistoryBreaksStatusTies(t *testing.T) {
 	}
 }
 
+func TestFlatIdleAndUnknownUseHistory(t *testing.T) {
+	cands := []hop.Candidate{
+		{Kind: hop.KindRepo, Label: "idle", OpenState: hop.OpenOpen, AgentStatus: "idle", WorkspaceIDs: []string{"idle"}},
+		{Kind: hop.KindWorktree, Label: "unknown", OpenCount: 1, AgentStatus: "unknown", WorkspaceIDs: []string{"unknown"}},
+		{Kind: hop.KindWorkspace, Label: "noAgent", OpenState: hop.OpenOpen, WorkspaceIDs: []string{"noAgent"}},
+		{Kind: hop.KindWorkspace, Label: "working", OpenState: hop.OpenOpen, AgentStatus: "working"},
+		{Kind: hop.KindRepo, Label: "closed", WorkspaceIDs: []string{"closed"}},
+	}
+	for _, tc := range []struct {
+		name   string
+		visits map[string]int64
+		want   string
+	}{
+		{"newer unknown", map[string]int64{"idle": 100, "unknown": 300, "noAgent": 200, "closed": 400}, "working unknown noAgent idle closed"},
+		{"newer idle", map[string]int64{"idle": 300, "unknown": 100, "noAgent": 200}, "working idle noAgent unknown closed"},
+		{"only no agent visited", map[string]int64{"noAgent": 100}, "working noAgent idle unknown closed"},
+		{"same visit", map[string]int64{"idle": 100, "unknown": 100, "noAgent": 100}, "working idle unknown noAgent closed"},
+		{"no history", nil, "working idle unknown noAgent closed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newHopWith(t, cands, config.Config{})
+			m.visits = tc.visits
+			m.buildList()
+			var labels []string
+			for _, idx := range m.view {
+				labels = append(labels, m.cands[idx].Label)
+			}
+			if got := strings.Join(labels, " "); got != tc.want {
+				t.Fatalf("order: %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadRecordsCurrentWorkspaceOnce(t *testing.T) {
 	history := recent.New(t.TempDir(), "session")
 	previous := time.Unix(100, 0)
@@ -1026,7 +1060,7 @@ func TestFlatAgentPriority(t *testing.T) {
 			t.Fatalf("order = %v, want %s", got, want)
 		}
 	}
-	want := "current childBlocked wsBlocked childDone orphanDone childWorking childWorking2 working idle childIdle wsIdle childUnknown unknown wsFuture closed group childClosed late"
+	want := "current childBlocked wsBlocked childDone orphanDone childWorking childWorking2 working idle childIdle childUnknown unknown wsIdle wsFuture closed group childClosed late"
 	expect(want)
 	// Rebuilding the list must retain the snapshot-based order.
 	mm, _ := m.Update(wtStateMsg{gen: m.loadGen, states: hop.WorktreeStateResult{

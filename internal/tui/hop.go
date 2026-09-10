@@ -1285,6 +1285,9 @@ func (m *HopModel) buildList() {
 		}
 		if open {
 			ranks[i] = 1 + hop.AgentStatusPriority(c.AgentStatus)
+			if c.AgentStatus == "idle" {
+				ranks[i] = 1
+			}
 			for _, id := range c.WorkspaceIDs {
 				visited[i] = max(visited[i], m.visits[id])
 			}
