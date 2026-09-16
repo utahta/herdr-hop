@@ -1562,8 +1562,6 @@ func cursorOnPath(t *testing.T, m *HopModel, path string) {
 
 func TestDeleteWorktreeAsksThenRemovesThroughHerdrWhenOpen(t *testing.T) {
 	m, fc, git := hopForDelete(t)
-	m.input.SetValue("feat-one")
-	m.refilter()
 	cursorOnPath(t, &m, "/w/one")
 	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
 	m = mm.(HopModel)
@@ -1582,7 +1580,7 @@ func TestDeleteWorktreeAsksThenRemovesThroughHerdrWhenOpen(t *testing.T) {
 		t.Fatalf("y must start the removal: cmd=%v pending=%v", cmd != nil, m.pending)
 	}
 	if m.input.Prompt != "hop> " || m.input.Value() != "" {
-		t.Errorf("a yes brings the prompt back and clears the query (it named the deleted worktree): %q %q", m.input.Prompt, m.input.Value())
+		t.Errorf("a yes brings the empty prompt back: %q %q", m.input.Prompt, m.input.Value())
 	}
 	msg := cmd()
 	if got := fc.calls; len(got) != 1 || got[0] != "wtremove ws1 force=false" {
@@ -1607,6 +1605,131 @@ func TestDeleteWorktreeAsksThenRemovesThroughHerdrWhenOpen(t *testing.T) {
 	}
 }
 
+func TestDeleteWorktreeKeepsSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name, query, path, want string
+		rows                    []int
+	}{
+		{"first result", "feat", "/w/one", "/w/two", []int{0, 1, 2, 7}},
+		{"middle result", "feat", "/w/two", "/w/six", []int{0, 1, 2, 7}},
+		{"last result", "feat", "/w/two", "/w/one", []int{0, 1, 2}},
+		{"only result", "feat-one", "/w/one", "", []int{0, 1, 2}},
+		{"repository query", "acme/api", "/w/one", "/w/two", []int{0, 1, 2, 7}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, _ := hopForDelete(t)
+			m.cfg.DefaultHost, m.cfg.CloneProtocol = "github.com", "https"
+			var cands []hop.Candidate
+			for _, i := range tc.rows {
+				cands = append(cands, m.cands[i])
+			}
+			m.cands = cands
+			ids := map[string]hop.RepoIdentity{
+				"/r/api": {ID: "github.com/acme/api", Paths: []string{"acme/api"}},
+			}
+			hop.ApplyRepoIDs(m.cands, ids)
+			m.input.SetValue(tc.query)
+			m.refilter()
+			cursorOnPath(t, &m, tc.path)
+			mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+			mm, cmd := mm.(HopModel).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+			m = mm.(HopModel)
+			if cmd == nil || m.input.Value() != tc.query {
+				t.Fatalf("confirmation lost query: %q", m.input.Value())
+			}
+			mm, reload := m.Update(cmd())
+			m = mm.(HopModel)
+			if reload == nil || !m.loading {
+				t.Fatalf("removal failed: %s", m.errMsg)
+			}
+			var remaining []hop.Candidate
+			for _, c := range cands {
+				if c.Path != tc.path {
+					c.RepoID, c.RepoPaths = "", nil
+					remaining = append(remaining, c)
+				}
+			}
+			mm, _ = m.Update(loadedMsg{cands: remaining, gen: m.loadGen, occupancy: hop.Occupancy{OK: true}})
+			m = mm.(HopModel)
+			check := func() {
+				t.Helper()
+				if m.input.Value() != tc.query {
+					t.Fatalf("reload lost query: %q", m.input.Value())
+				}
+				c, ok := m.selected()
+				if tc.want == "" {
+					if ok || m.rowCount() != 0 {
+						t.Fatalf("want no results, got %+v", c)
+					}
+				} else if !ok || c.Path != tc.want {
+					t.Fatalf("selected %+v, want %s", c, tc.want)
+				}
+			}
+			check()
+			mm, _ = m.Update(resolvedMsg{gen: m.loadGen, ids: ids})
+			m = mm.(HopModel)
+			check()
+		})
+	}
+}
+
+func TestDeleteWorktreeSelectsNextRowWithoutPath(t *testing.T) {
+	for _, kind := range []hop.Kind{hop.KindClone, hop.KindWorkspace} {
+		t.Run(kind.String(), func(t *testing.T) {
+			m, _, _ := hopForDelete(t)
+			m.cfg.DefaultHost, m.cfg.CloneProtocol = "github.com", "https"
+			m.cands = m.cands[:3]
+			var ids map[string]hop.RepoIdentity
+			if kind == hop.KindWorkspace {
+				ids = map[string]hop.RepoIdentity{"/r/api": {ID: "github.com/acme/api"}}
+				hop.ApplyRepoIDs(m.cands, ids)
+				for _, id := range []string{"next", "other"} {
+					m.cands = append(m.cands, hop.Candidate{
+						Kind: kind, Label: "acme/api workspace", OpenState: hop.OpenOpen, OpenWorkspaceID: id,
+					})
+				}
+			}
+			m.input.SetValue("acme/api")
+			m.refilter()
+			cursorOnPath(t, &m, "/w/two")
+			next, ok := m.rowAt(m.cursor + 1)
+			if !ok || next.Kind != kind || next.Path != "" {
+				t.Fatalf("expected next row without path, got %+v", next)
+			}
+			mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+			mm, cmd := mm.(HopModel).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+			m = mm.(HopModel)
+			if cmd == nil {
+				t.Fatal("no removal command")
+			}
+			mm, reload := m.Update(cmd())
+			m = mm.(HopModel)
+			if reload == nil {
+				t.Fatalf("removal refused: %s", m.errMsg)
+			}
+			remaining := append([]hop.Candidate(nil), m.cands[:2]...)
+			if kind == hop.KindWorkspace {
+				// Workspace identity must survive a change in snapshot order.
+				remaining = append(remaining, m.cands[4], m.cands[3])
+			}
+			for i := range remaining {
+				remaining[i].RepoID = ""
+			}
+			mm, _ = m.Update(loadedMsg{cands: remaining, gen: m.loadGen, occupancy: hop.Occupancy{OK: true}})
+			m = mm.(HopModel)
+			mm, _ = m.Update(resolvedMsg{gen: m.loadGen, ids: ids})
+			m = mm.(HopModel)
+			selected, ok := m.selected()
+			if !ok || selected.Kind != next.Kind || selected.Path != "" || selected.OpenWorkspaceID != next.OpenWorkspaceID {
+				t.Fatalf("want next row %+v, got %+v", next, selected)
+			}
+			if m.input.Value() != "acme/api" {
+				t.Fatalf("query changed: %q", m.input.Value())
+			}
+		})
+	}
+}
+
 func TestDeleteWorktreeThroughGitWhenNoWorkspaceIsOpen(t *testing.T) {
 	m, fc, git := hopForDelete(t)
 	cursorOnPath(t, &m, "/w/two")
@@ -1627,7 +1750,7 @@ func TestDeleteWorktreeThroughGitWhenNoWorkspaceIsOpen(t *testing.T) {
 
 func TestDeleteWorktreeAnyOtherKeyIsNo(t *testing.T) {
 	m, fc, git := hopForDelete(t)
-	m.input.SetValue("two")
+	m.input.SetValue("feat")
 	m.refilter()
 	cursorOnPath(t, &m, "/w/two")
 	for _, key := range []tea.KeyMsg{{Type: tea.KeyRunes, Runes: []rune{'n'}}, {Type: tea.KeyEsc}, {Type: tea.KeyEnter}, {Type: tea.KeyRunes, Runes: []rune{'x'}}} {
@@ -1641,8 +1764,11 @@ func TestDeleteWorktreeAnyOtherKeyIsNo(t *testing.T) {
 		if cmd != nil || m.confirm != nil || m.pending || m.quit {
 			t.Fatalf("%v must be a no: cmd=%v confirm=%v pending=%v quit=%v", key, cmd != nil, m.confirm != nil, m.pending, m.quit)
 		}
-		if m.input.Value() != "two" || m.input.Prompt != "hop> " {
+		if m.input.Value() != "feat" || m.input.Prompt != "hop> " {
 			t.Fatalf("query and prompt must come back after %v: %q %q", key, m.input.Value(), m.input.Prompt)
+		}
+		if c, ok := m.selected(); !ok || c.Path != "/w/two" {
+			t.Fatalf("cancel changed selection: %+v", c)
 		}
 	}
 	if len(fc.calls)+len(git.removed) != 0 {
@@ -1737,27 +1863,28 @@ func TestDeleteWorktreeDirtyCheckoutIsExplained(t *testing.T) {
 	if !strings.Contains(m.errMsg, "modified or untracked files") || !strings.Contains(m.errMsg, "commit, stash or clean") {
 		t.Errorf("advice expected, got %q", m.errMsg)
 	}
-	// No reload happened, so the list must already match the (now empty)
-	// input: every row, no leftover filter or highlight.
-	if m.input.Value() != "" || len(m.view) != len(m.cands) || len(m.matches) != 0 {
+	if m.input.Value() != "feat-one" || len(m.view) != 1 || len(m.matches) != 1 {
 		t.Errorf("input %q, view %d/%d rows, %d highlights: the list must match the input", m.input.Value(), len(m.view), len(m.cands), len(m.matches))
 	}
 	// git's wording for a closed worktree gets the same advice.
 	m.errMsg = ""
+	m.input.SetValue("feat")
+	m.refilter()
 	git.removeErr = errors.New("git worktree remove: fatal: '/w/two' contains modified or untracked files, use --force to delete it")
 	cursorOnPath(t, &m, "/w/two")
 	mm, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
 	mm, cmd = mm.(HopModel).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	mm, _ = mm.(HopModel).Update(cmd())
-	if got := mm.(HopModel).errMsg; !strings.Contains(got, "commit, stash or clean") {
-		t.Errorf("advice expected, got %q", got)
+	m = mm.(HopModel)
+	if !strings.Contains(m.errMsg, "commit, stash or clean") {
+		t.Errorf("advice expected, got %q", m.errMsg)
+	}
+	if c, ok := m.selected(); !ok || c.Path != "/w/two" || m.input.Value() != "feat" {
+		t.Errorf("failed deletion changed query or selection: %q %+v", m.input.Value(), c)
 	}
 }
 
 func TestDeleteWorktreeIgnoresTypingWhileRemoving(t *testing.T) {
-	// Between the yes and the reload the query is empty on purpose; keys
-	// typed in that window must not become a filter the reload then hides
-	// the repository behind.
 	m, _, _ := hopForDelete(t)
 	m.input.SetValue("feat-one")
 	m.refilter()
@@ -1767,13 +1894,13 @@ func TestDeleteWorktreeIgnoresTypingWhileRemoving(t *testing.T) {
 	m = mm.(HopModel)
 	mm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
 	m = mm.(HopModel)
-	if m.input.Value() != "" {
+	if m.input.Value() != "feat-one" {
 		t.Fatalf("typing while the removal runs must be ignored, got %q", m.input.Value())
 	}
 	mm, _ = m.Update(cmd())
 	m = mm.(HopModel)
-	if !m.loading || m.input.Value() != "" {
-		t.Errorf("the reload must see an empty query: loading=%v query=%q", m.loading, m.input.Value())
+	if !m.loading || m.input.Value() != "feat-one" {
+		t.Errorf("the reload must keep the query: loading=%v query=%q", m.loading, m.input.Value())
 	}
 }
 

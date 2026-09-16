@@ -98,10 +98,9 @@ type wtStateMsg struct {
 }
 type doneMsg struct{ err error }
 
-// removedMsg reports a worktree deletion; repoRoot is where the cursor
-// should land after the reload that follows a success.
+// removedMsg carries the selection to restore after a successful deletion.
 type removedMsg struct {
-	repoRoot string
+	focusRow *hop.Candidate
 	err      error
 }
 
@@ -206,12 +205,10 @@ type HopModel struct {
 	loading bool
 	pending bool // an open/create command is in flight; ignore Enter/Ctrl-N
 	// confirm is set while ctrl-d awaits a yes/no on deleting a worktree:
-	// the input shows the question instead of the query, which is kept
-	// for when the answer is no.
+	// the input shows the question instead of the saved query.
 	confirm *removeConfirm
-	// focusPath, when set, names the row the next load should put the
-	// cursor on (the repository whose worktree was just deleted).
-	focusPath string
+	// focusRow preserves the selection across reloading and identity resolution.
+	focusRow *hop.Candidate
 	// occupancy mirrors the current load's loadedMsg.occupancy.
 	occupancy hop.Occupancy
 	clone     cloneState
@@ -259,7 +256,7 @@ func (m HopModel) WithHistory(history *recent.Store) HopModel {
 type removeConfirm struct {
 	cand  hop.Candidate
 	name  string // what the question names (branch, else label), sanitized
-	query string // the filter to restore when the answer is no
+	query string // the filter to restore after confirmation
 }
 
 // confirmPrompt renders the question for the current width, so that a
@@ -280,8 +277,7 @@ func (m HopModel) confirmPrompt() string {
 	return ansi.Truncate("delete? (y/N) ", max(m.width-1, 0), "")
 }
 
-// askRemove turns the input into the deletion question for c. The query is
-// kept aside and comes back on any answer but yes.
+// askRemove saves the query while the input shows the deletion question.
 func (m *HopModel) askRemove(c hop.Candidate) {
 	name := c.Branch
 	if name == "" {
@@ -294,25 +290,22 @@ func (m *HopModel) askRemove(c hop.Candidate) {
 	m.input.PromptStyle = styleErr.Bold(true)
 }
 
-// endRemove leaves the confirmation, restoring the prompt. The query comes
-// back on a no; a yes clears it, so the reload that follows shows the
-// worktree's repository (which the filter for the deleted worktree would
-// not have matched) and the cursor can land on it.
-func (m *HopModel) endRemove(yes bool) {
+// endRemove restores the query and selected worktree after confirmation.
+func (m *HopModel) endRemove() {
 	if m.confirm == nil {
 		return
 	}
-	if yes {
-		m.input.SetValue("")
-	} else {
-		m.input.SetValue(m.confirm.query)
-	}
+	c := m.confirm.cand
+	m.input.SetValue(m.confirm.query)
 	m.input.CursorEnd()
 	m.confirm = nil
-	// The list must match the input again at once: a failed deletion does
-	// not reload, and an empty input over the old filter's rows (and its
-	// highlights and synthetic rows) would be a lie.
 	m.refilter()
+	for i, cand := range m.cands {
+		if cand.Path == c.Path {
+			m.cursorTo(i)
+			break
+		}
+	}
 	m.input.Prompt, m.input.PromptStyle = "hop> ", stylePromptHop
 	if m.worktreeMode {
 		m.input.Prompt, m.input.PromptStyle = "repo> ", stylePromptWorktree
@@ -324,8 +317,17 @@ func (m *HopModel) endRemove(yes bool) {
 // whether to ask, not to act.
 func (m HopModel) remove(c hop.Candidate) tea.Cmd {
 	h, git := m.h, m.git
+	focusRow := &hop.Candidate{Kind: hop.KindRepo, Path: c.RepoRoot}
+	if strings.TrimSpace(m.input.Value()) != "" {
+		focusRow = nil
+		if next, ok := m.rowAt(m.cursor + 1); ok {
+			focusRow = &next
+		} else if prev, ok := m.rowAt(m.cursor - 1); ok {
+			focusRow = &prev
+		}
+	}
 	return func() tea.Msg {
-		return removedMsg{repoRoot: c.RepoRoot, err: hop.RemoveNow(h, git, c, false)}
+		return removedMsg{focusRow: focusRow, err: hop.RemoveNow(h, git, c, false)}
 	}
 }
 
@@ -731,17 +733,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.log.Printf("warn: %s", m.warn)
 		}
 		m.refilter()
-		if m.focusPath != "" {
-			// After a deletion the cursor goes to the repository the
-			// worktree belonged to, not back to the top.
-			for i, c := range m.cands {
-				if c.Path == m.focusPath {
-					m.cursorTo(i)
-					break
-				}
-			}
-			m.focusPath = ""
-		}
+		m.restoreFocus()
 		// Worktree mode with a recognizable current repository skips the
 		// repo picker: prefix+t goes straight to the branch screen of the
 		// repository the user is in (esc still returns to the picker for
@@ -807,6 +799,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// and a cursor the user parked must not jump for an invisible update.
 		if m.queryNeedsIDs() {
 			m.refilter()
+			m.restoreFocus()
 		}
 		return m, nil
 	case removedMsg:
@@ -817,7 +810,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.log.Printf("remove worktree: done")
-		m.focusPath = msg.repoRoot
+		m.focusRow = msg.focusRow
 		return m, m.startLoad()
 	case doneMsg:
 		m.pending = false
@@ -914,7 +907,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The question takes every key: y deletes, anything else is no.
 			c := m.confirm.cand
 			yes := msg.Type == tea.KeyRunes && (string(msg.Runes) == "y" || string(msg.Runes) == "Y")
-			m.endRemove(yes)
+			m.endRemove()
 			if yes {
 				m.pending = true
 				m.log.Printf("remove worktree %s (open=%v)", c.Path, c.IsOpen())
@@ -1007,6 +1000,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.busy() {
 				return m, nil
 			}
+			m.focusRow = nil
 			return m, m.startLoad()
 		case tea.KeyUp, tea.KeyCtrlP:
 			m.moveCursor(-1)
@@ -1016,9 +1010,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.pending {
-			// A command is in flight (an open, a deletion): typing now
-			// would edit a query the reload that follows is meant to see
-			// as it is — empty, after a deletion.
+			// Editing the query would invalidate the selection saved for the reload.
 			return m, nil
 		}
 	}
@@ -1026,6 +1018,7 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	before := m.input.Value()
 	m.input, cmd = m.input.Update(msg)
 	if m.input.Value() != before {
+		m.focusRow = nil
 		m.refilter()
 		// A query that names a repository or PR needs the remote identities
 		// (clone row, pull rows): resolve them now if not yet done. Once
@@ -1315,6 +1308,32 @@ func (m HopModel) currentRepo() (root, label string, ok bool) {
 	return "", "", false
 }
 
+// restoreFocus keeps the post-deletion selection through identity resolution.
+func (m *HopModel) restoreFocus() {
+	if m.focusRow == nil {
+		return
+	}
+	for i := range m.view {
+		c, ok := m.rowAt(i)
+		if !ok || c.Kind != m.focusRow.Kind || c.PRBranch != m.focusRow.PRBranch {
+			continue
+		}
+		if c.Kind == hop.KindWorkspace {
+			if c.OpenWorkspaceID != m.focusRow.OpenWorkspaceID {
+				continue
+			}
+		} else if c.Path != m.focusRow.Path {
+			continue
+		}
+		m.cursor = i
+		m.scrollToCursor()
+		break
+	}
+	if !m.queryNeedsIDs() || !m.idsPending() {
+		m.focusRow = nil
+	}
+}
+
 // cursorTo puts the cursor on the row showing candidate index idx (the first
 // row when that candidate is not visible) and re-anchors the window.
 func (m *HopModel) cursorTo(idx int) {
@@ -1366,6 +1385,7 @@ func (m *HopModel) scrollToCursor() { m.top = m.scrollStart() }
 // top was last saved (e.g. the "opening..." line appearing), and the move
 // must be relative to what the user currently sees, not to a stale top.
 func (m *HopModel) moveCursor(delta int) {
+	m.focusRow = nil
 	m.top = m.scrollStart()
 	m.cursor = max(0, min(m.cursor+delta, m.rowCount()-1))
 	m.scrollToCursor()
