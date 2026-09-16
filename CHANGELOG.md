@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.5.0](https://github.com/utahta/herdr-hop/compare/v0.4.0...v0.5.0) - 2026-09-16
+
+- Preserve search and selection after deleting worktrees by @utahta in https://github.com/utahta/herdr-hop/pull/11
+
 ## [v0.4.0](https://github.com/utahta/herdr-hop/compare/v0.3.1...v0.4.0) - 2026-09-10
 
 - Prioritize visit history across idle and unknown workspaces by @utahta in https://github.com/utahta/herdr-hop/pull/9
