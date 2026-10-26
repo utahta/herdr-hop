@@ -1583,8 +1583,10 @@ func TestDeleteWorktreeAsksThenRemovesThroughHerdrWhenOpen(t *testing.T) {
 		t.Errorf("a yes brings the empty prompt back: %q %q", m.input.Prompt, m.input.Value())
 	}
 	msg := cmd()
-	if got := fc.calls; len(got) != 1 || got[0] != "wtremove ws1 force=false" {
-		t.Fatalf("open worktree goes through herdr, without force: %v", got)
+	// herdr then switches to the repository's workspace; focus goes back
+	// to the picker's own (ws3).
+	if got := strings.Join(fc.calls, ","); got != "wtremove ws1 force=false,focus ws3" {
+		t.Fatalf("open worktree goes through herdr, without force, then focus returns: %v", got)
 	}
 	if len(git.removed) != 0 {
 		t.Fatalf("git must not be used for an open worktree: %v", git.removed)
@@ -1602,6 +1604,64 @@ func TestDeleteWorktreeAsksThenRemovesThroughHerdrWhenOpen(t *testing.T) {
 	m = mm.(HopModel)
 	if c, ok := m.selected(); !ok || c.Path != "/r/api" {
 		t.Errorf("cursor must land on the repository, got %+v", c)
+	}
+}
+
+func TestDeleteCurrentWorktreeRemovesThenMovesAndCloses(t *testing.T) {
+	m, fc, _ := hopForDelete(t)
+	m.visits = map[string]int64{"ws1": 10, "ws6": 20, "ws3": 30}
+	cursorOnPath(t, &m, "/w/three")
+	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m = mm.(HopModel)
+	if cmd != nil || m.confirm == nil || m.errMsg != "" {
+		t.Fatalf("ctrl-d on the current worktree must ask: confirm=%v err=%q", m.confirm != nil, m.errMsg)
+	}
+	if v := stripANSI(m.View()); !strings.Contains(v, "delete worktree feat-three? (y/N)") || !strings.Contains(v, "go to the last workspace") {
+		t.Fatalf("question missing:\n%s", v)
+	}
+	mm, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = mm.(HopModel)
+	msg := cmd()
+	if got := strings.Join(fc.calls, ","); got != "wtremove ws3 force=false,focus ws6" {
+		t.Fatalf("the move must follow the removal: %s", got)
+	}
+	mm, quit := m.Update(msg)
+	if !mm.(HopModel).quit || quit == nil {
+		t.Fatal("its workspace gone, the picker closes")
+	}
+
+	// Removed, but the move failed: the picker still closes (there is no
+	// workspace of its own to stay on) and the failure goes to the log.
+	var logged strings.Builder
+	m.log = log.New(&logged, "", 0)
+	mm, quit = m.Update(removedMsg{left: true, err: fmt.Errorf("%w: %w", hop.ErrRefocus, errors.New("socket gone"))})
+	if got := mm.(HopModel); !got.quit || quit == nil || got.errMsg != "" {
+		t.Errorf("move failed: quit=%v err=%q", got.quit, got.errMsg)
+	}
+	if !strings.Contains(logged.String(), "socket gone") {
+		t.Errorf("the failed move must be logged: %q", logged.String())
+	}
+
+	// A refused removal moves nobody and keeps the picker, with the usual advice.
+	m, fc, _ = hopForDelete(t)
+	fc.removeErr = errors.New("herdr worktree: fatal: '/w/three' contains modified or untracked files, use --force to delete it (dirty_worktree_requires_force)")
+	cursorOnPath(t, &m, "/w/three")
+	mm, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	mm, cmd = mm.(HopModel).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	mm, _ = mm.(HopModel).Update(cmd())
+	m = mm.(HopModel)
+	if strings.Join(fc.calls, ",") != "wtremove ws3 force=false" || m.quit || !strings.Contains(m.errMsg, "commit, stash or clean") {
+		t.Errorf("refused: calls=%v quit=%v err=%q", fc.calls, m.quit, m.errMsg)
+	}
+}
+
+func TestDeleteWorktreeRefocusFailureStillReloads(t *testing.T) {
+	m, _, _ := hopForDelete(t)
+	m.pending = true
+	mm, reload := m.Update(removedMsg{err: fmt.Errorf("%w: %w", hop.ErrRefocus, errors.New("socket gone"))})
+	m = mm.(HopModel)
+	if reload == nil || !m.loading || m.errMsg != "" || m.quit {
+		t.Errorf("the checkout is gone: reload=%v loading=%v err=%q quit=%v", reload != nil, m.loading, m.errMsg, m.quit)
 	}
 }
 
@@ -1794,10 +1854,6 @@ func TestDeleteWorktreeRefusals(t *testing.T) {
 		t.Errorf("repository row: %q", got.errMsg)
 	}
 	m.errMsg = ""
-	if got := try("/w/three"); !strings.Contains(got.errMsg, "worktree you are in") {
-		t.Errorf("current worktree: %q", got.errMsg)
-	}
-	m.errMsg = ""
 	if got := try("/w/five"); !strings.Contains(got.errMsg, "worktree you are in") {
 		t.Errorf("worktree containing the pane's directory: %q", got.errMsg)
 	}
@@ -1955,7 +2011,7 @@ func TestDeleteWorktreeReChecksHerdrAtYes(t *testing.T) {
 	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	m = mm.(HopModel)
 	cmd()
-	if got := fc.calls; len(got) != 1 || got[0] != "wtremove ws9 force=false" {
+	if got := strings.Join(fc.calls, ","); got != "wtremove ws9 force=false,focus ws3" {
 		t.Fatalf("the fresh open state must route through herdr: %v (git: %v)", got, git.removed)
 	}
 	if len(git.removed) != 0 {

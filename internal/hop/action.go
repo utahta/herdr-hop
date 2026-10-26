@@ -79,7 +79,8 @@ func managedWorktreeWorkspace(ws herdr.Workspace) bool {
 // the load's snapshot) is every directory a pane or workspace is in: a
 // worktree that is one of them, or contains one, is in use and refused, on
 // path boundaries so /w/feat does not claim /w/feature/x — except for the
-// panes of the worktree's own workspace, which herdr closes with it.
+// panes of the worktree's own workspace, which herdr closes with it, even
+// when it is the current one (RemoveNow then moves elsewhere).
 // Without the snapshot, or with a pane whose directory is unknown, nothing
 // can be proven unused and every deletion is refused. The UI asks
 // CanRemove before posing the confirmation question, so a refusal is shown
@@ -92,8 +93,6 @@ func CanRemove(c Candidate, occ Occupancy) error {
 		return ErrRemoveSnapshotUnknown
 	case occ.UnknownPanes > 0:
 		return fmt.Errorf("%w (%d)", ErrRemovePanesUnknown, occ.UnknownPanes)
-	case c.Current:
-		return ErrRemoveCurrent
 	case c.OpenState == OpenUnknown:
 		return ErrWorktreeStateUnknown
 	case c.OpenCount > 1:
@@ -107,11 +106,11 @@ func CanRemove(c Candidate, occ Occupancy) error {
 		if !inside {
 			continue
 		}
-		if o.Current {
-			return ErrRemoveCurrent
-		}
 		if c.IsOpen() && o.WorkspaceID == c.OpenWorkspaceID && o.Managed {
 			continue // the worktree's own (herdr-managed) workspace goes with it
+		}
+		if o.Current {
+			return ErrRemoveCurrent
 		}
 		return fmt.Errorf("%w (%s)", ErrRemoveInside, o.Path)
 	}
@@ -119,10 +118,13 @@ func CanRemove(c Candidate, occ Occupancy) error {
 }
 
 // RemoveClient is what RemoveNow needs from herdr: the snapshot and
-// worktree list to re-check with, and the removal itself.
+// worktree list to re-check with, the removal itself, and setting focus
+// after it.
 type RemoveClient interface {
 	Lister
 	WorktreeRemover
+	WorkspaceFocus(id string) error
+	WorkspaceCreate(cwd, label string) error
 }
 
 // Refresh re-reads, from herdr, everything CanRemove relies on for c: the
@@ -145,19 +147,25 @@ type RemoveClient interface {
 // herdr-managed worktree workspace can be closed by `herdr worktree remove`,
 // so the fresh row is marked open only for one of those; a plain workspace
 // stays an occupant and blocks the removal (CanRemove).
-func Refresh(h Lister, c Candidate) (Candidate, Occupancy, error) {
-	fresh := c
+//
+// focus is the workspace to focus after the removal: exitFor's pick when
+// fresh is the focused workspace, else the focused workspace itself.
+func Refresh(h Lister, c Candidate, visits map[string]int64) (fresh Candidate, occ Occupancy, focus string, err error) {
+	fresh = c
 	fresh.OpenCount, fresh.Current = 0, false
 	fresh.OpenState, fresh.OpenWorkspaceID = OpenUnknown, ""
 	snap, err := h.Snapshot()
 	if err != nil {
-		return fresh, Occupancy{}, nil // CanRemove: snapshot unknown
+		return fresh, Occupancy{}, "", nil // CanRemove: snapshot unknown
 	}
-	occ := OccupancyOf(snap)
+	occ = OccupancyOf(snap)
 	known, managed := map[string]bool{}, map[string]bool{}
 	for _, ws := range snap.Workspaces {
 		known[ws.ID] = true
 		managed[ws.ID] = managedWorktreeWorkspace(ws)
+		if ws.Focused {
+			focus = ws.ID
+		}
 		if workspacePath(ws, snap) == c.Path {
 			fresh.OpenCount++
 			fresh.Current = fresh.Current || ws.Focused
@@ -165,10 +173,10 @@ func Refresh(h Lister, c Candidate) (Candidate, Occupancy, error) {
 	}
 	l, err := h.WorktreeList(c.RepoRoot)
 	if err != nil {
-		return fresh, occ, nil // CanRemove: state unknown
+		return fresh, occ, "", nil // CanRemove: state unknown
 	}
 	if scan.Normalize(l.Source.RepoRoot) != c.RepoRoot {
-		return fresh, occ, fmt.Errorf("%w (now listed under %s)", ErrRemoveChanged, l.Source.RepoRoot)
+		return fresh, occ, "", fmt.Errorf("%w (now listed under %s)", ErrRemoveChanged, l.Source.RepoRoot)
 	}
 	var entry *herdr.Worktree
 	for i := range l.Worktrees {
@@ -179,15 +187,15 @@ func Refresh(h Lister, c Candidate) (Candidate, Occupancy, error) {
 	}
 	switch {
 	case entry == nil:
-		return fresh, occ, fmt.Errorf("%w (no longer a worktree of this repository)", ErrRemoveChanged)
+		return fresh, occ, "", fmt.Errorf("%w (no longer a worktree of this repository)", ErrRemoveChanged)
 	case !entry.IsLinkedWorktree:
-		return fresh, occ, fmt.Errorf("%w (it is the main checkout)", ErrRemoveChanged)
+		return fresh, occ, "", fmt.Errorf("%w (it is the main checkout)", ErrRemoveChanged)
 	case entry.IsPrunable:
-		return fresh, occ, fmt.Errorf("%w (its directory is gone: `git worktree prune`)", ErrRemoveChanged)
+		return fresh, occ, "", fmt.Errorf("%w (its directory is gone: `git worktree prune`)", ErrRemoveChanged)
 	case branchOf(*entry) != c.Branch:
 		// "" is a state of its own (detached): named → other, named →
 		// detached and detached → named are all a different worktree.
-		return fresh, occ, fmt.Errorf("%w (now on %s, confirmed %s)", ErrRemoveChanged, describeBranch(branchOf(*entry)), describeBranch(c.Branch))
+		return fresh, occ, "", fmt.Errorf("%w (now on %s, confirmed %s)", ErrRemoveChanged, describeBranch(branchOf(*entry)), describeBranch(c.Branch))
 	}
 	fresh.OpenState = OpenClosed
 	if id := entry.OpenWorkspaceID; id != nil && *id != "" {
@@ -202,15 +210,18 @@ func Refresh(h Lister, c Candidate) (Candidate, Occupancy, error) {
 			// left to the occupancy check: the snapshot predates the list,
 			// and a pane that moved into the checkout in between is not
 			// among the occupants it knows.
-			return fresh, occ, fmt.Errorf("%w (workspace %s)", ErrRemoveInside, *id)
+			return fresh, occ, "", fmt.Errorf("%w (workspace %s)", ErrRemoveInside, *id)
 		default:
 			// A workspace the snapshot has never seen: it was opened between
 			// the two reads, and neither its kind nor where its panes are is
 			// known. Not "closed" — undecidable; ask for a reload.
-			return fresh, occ, fmt.Errorf("%w (a workspace opened on it meanwhile)", ErrRemoveChanged)
+			return fresh, occ, "", fmt.Errorf("%w (a workspace opened on it meanwhile)", ErrRemoveChanged)
 		}
 	}
-	return fresh, occ, nil
+	if fresh.Current {
+		focus = exitFor(snap, l, fresh, visits)
+	}
+	return fresh, occ, focus, nil
 }
 
 // branchOf is a listed worktree's branch in the candidates' convention:
@@ -229,25 +240,65 @@ func describeBranch(b string) string {
 	return b
 }
 
+// exitFor picks the workspace to focus after removing c's own, the focused
+// one: the most recently visited other workspace, else the repository's
+// workspace. "" means neither exists.
+func exitFor(snap *herdr.Snapshot, l *herdr.WorktreeList, c Candidate, visits map[string]int64) string {
+	var best string
+	known := map[string]bool{}
+	for _, ws := range snap.Workspaces {
+		known[ws.ID] = true
+		if ws.ID != c.OpenWorkspaceID && visits[ws.ID] > visits[best] {
+			best = ws.ID
+		}
+	}
+	if best != "" {
+		return best
+	}
+	if id := l.Source.SourceWorkspaceID; id != nil && known[*id] && *id != c.OpenWorkspaceID {
+		return *id
+	}
+	return ""
+}
+
 // RemoveNow is Remove on freshly re-read state (Refresh): the deletion is
 // decided and routed by what herdr says now, not by the rows the picker
-// was opened with.
-func RemoveNow(h RemoveClient, g GitWorktreeRemover, c Candidate, force bool) error {
-	fresh, occ, err := Refresh(h, c)
+// was opened with. herdr, closing a worktree's workspace, switches to the
+// repository's workspace, so focus is set afterwards: back to the focused
+// workspace, or when that was c's own, to the most recently visited other
+// one (visits), else the repository's, created if none is open. left
+// reports that c's workspace was the focused one; a failure to set focus
+// after a removal is ErrRefocus.
+func RemoveNow(h RemoveClient, g GitWorktreeRemover, c Candidate, force bool, visits map[string]int64) (left bool, err error) {
+	fresh, occ, focus, err := Refresh(h, c, visits)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return Remove(h, g, fresh, occ, force)
+	if err := Remove(h, g, fresh, occ, force); err != nil {
+		return false, err
+	}
+	switch {
+	case !fresh.IsOpen():
+		// Removed through git: no workspace was closed.
+	case focus != "":
+		err = h.WorkspaceFocus(focus)
+	case fresh.Current:
+		err = h.WorkspaceCreate(fresh.RepoRoot, WorkspaceLabel(fresh.RepoLabel))
+	}
+	if err != nil {
+		return fresh.Current, fmt.Errorf("%w: %w", ErrRefocus, err)
+	}
+	return fresh.Current, nil
 }
 
 // Remove deletes a worktree checkout, never its branch. An open worktree
 // goes through herdr (which closes the workspace as well); one no workspace
 // is open for goes through git. Both refuse a checkout with modified or
 // untracked files unless force is set. Refused (see CanRemove): rows that
-// are not worktrees, the worktree in use by the picker's own pane, one
-// whose open state is unknown, and one with several workspaces open on it
-// — herdr closes only the workspace it is given, and the others would be
-// left pointing at a directory that no longer exists.
+// are not worktrees, one a pane of another workspace is in, one whose open
+// state is unknown, and one with several workspaces open on it — herdr
+// closes only the workspace it is given, and the others would be left
+// pointing at a directory that no longer exists.
 func Remove(h WorktreeRemover, g GitWorktreeRemover, c Candidate, occ Occupancy, force bool) error {
 	if err := CanRemove(c, occ); err != nil {
 		return err
@@ -351,9 +402,12 @@ var (
 	ErrCloneRow = errors.New("clone rows are executed by the UI")
 	// ErrNotWorktreeRow is returned by Remove for anything but a worktree.
 	ErrNotWorktreeRow = errors.New("only worktree rows can be deleted")
-	// ErrRemoveCurrent refuses to delete the worktree the picker was
-	// invoked from: the pane's directory would vanish under it.
+	// ErrRemoveCurrent refuses a worktree the picker's workspace has a pane
+	// in when that workspace is not the worktree's own: herdr would not
+	// close it, and the pane's directory would vanish under it.
 	ErrRemoveCurrent = errors.New("this is the worktree you are in: switch elsewhere first")
+	// ErrRefocus: the worktree was removed; only setting focus failed.
+	ErrRefocus = errors.New("removed, but focus could not be set")
 	// ErrRemoveShared refuses a worktree that several workspaces are open
 	// on: only one of them would be closed with it.
 	ErrRemoveShared = errors.New("several workspaces are open on this worktree: close the extra ones first")
