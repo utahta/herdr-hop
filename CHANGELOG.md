@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.5.1](https://github.com/utahta/herdr-hop/compare/v0.5.0...v0.5.1) - 2026-10-26
+
+- Allow deleting the current worktree and keep focus after deletions by @utahta in https://github.com/utahta/herdr-hop/pull/13
+
 ## [v0.5.0](https://github.com/utahta/herdr-hop/compare/v0.4.0...v0.5.0) - 2026-09-16
 
 - Preserve search and selection after deleting worktrees by @utahta in https://github.com/utahta/herdr-hop/pull/11
