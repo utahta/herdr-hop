@@ -643,8 +643,9 @@ func TestRemoveRoutesAndRefuses(t *testing.T) {
 	}
 	// Panes sit in subdirectories of /w/e (the picker's own workspace) and
 	// /w/g (another one's inactive pane): neither worktree is Current or
-	// counted — but both are in use.
-	occ := Occupancy{OK: true, Occupants: []Occupant{{Path: "/w/e/sub/dir", WorkspaceID: "cur", Current: true}, {Path: "/w/g/x", WorkspaceID: "other"}}}
+	// counted — but both are in use. The picker's workspace, a plain one,
+	// also has a pane at /w/c, whose own workspace is ws2.
+	occ := Occupancy{OK: true, Occupants: []Occupant{{Path: "/w/e/sub/dir", WorkspaceID: "cur", Current: true}, {Path: "/w/g/x", WorkspaceID: "other"}, {Path: "/w/c", WorkspaceID: "cur", Current: true}}}
 	for name, c := range map[string]Candidate{
 		"repo":     {Kind: KindRepo, Path: "/r", OpenState: OpenClosed},
 		"current":  {Kind: KindWorktree, Path: "/w/c", RepoRoot: "/r", OpenState: OpenOpen, OpenWorkspaceID: "ws2", Current: true},
@@ -715,14 +716,26 @@ func TestOccupancyOfReadsEveryPane(t *testing.T) {
 
 type fakeRemoveClient struct {
 	fakeLister
-	snap    *herdr.Snapshot
-	snapErr error
-	removed []string
+	snap      *herdr.Snapshot
+	snapErr   error
+	removed   []string
+	actions   []string // remove, focus and create, in call order
+	removeErr error
+	focusErr  error
 }
 
 func (f *fakeRemoveClient) Snapshot() (*herdr.Snapshot, error) { return f.snap, f.snapErr }
 func (f *fakeRemoveClient) WorktreeRemove(id string, force bool) error {
 	f.removed = append(f.removed, fmt.Sprintf("%s force=%v", id, force))
+	f.actions = append(f.actions, fmt.Sprintf("remove %s force=%v", id, force))
+	return f.removeErr
+}
+func (f *fakeRemoveClient) WorkspaceFocus(id string) error {
+	f.actions = append(f.actions, "focus "+id)
+	return f.focusErr
+}
+func (f *fakeRemoveClient) WorkspaceCreate(cwd, label string) error {
+	f.actions = append(f.actions, "create "+cwd+" label="+label)
 	return nil
 }
 
@@ -736,7 +749,7 @@ func TestRemoveNowDecidesOnFreshState(t *testing.T) {
 	g := &fakeGitRemover{}
 	// The row still says closed; herdr now has ws9 on it.
 	stale := Candidate{Kind: KindWorktree, Path: "/w/b", Branch: "feat-b", RepoRoot: "/r", OpenState: OpenClosed}
-	if err := RemoveNow(h, g, stale, false); err != nil {
+	if _, err := RemoveNow(h, g, stale, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.removed) != 1 || h.removed[0] != "ws9 force=false" || len(g.calls) != 0 {
@@ -745,18 +758,18 @@ func TestRemoveNowDecidesOnFreshState(t *testing.T) {
 	// A second workspace appeared on it: refused.
 	h.removed = nil
 	h.snap.Workspaces = append(h.snap.Workspaces, herdr.Workspace{ID: "ws10", Worktree: &herdr.WorkspaceWorktree{CheckoutPath: "/w/b", IsLinkedWorktree: true}})
-	if err := RemoveNow(h, g, stale, false); !errors.Is(err, ErrRemoveShared) {
+	if _, err := RemoveNow(h, g, stale, false, nil); !errors.Is(err, ErrRemoveShared) {
 		t.Errorf("two workspaces now: %v", err)
 	}
 	// The snapshot fails at that moment: refused.
 	h.snapErr = errors.New("socket gone")
-	if err := RemoveNow(h, g, stale, false); !errors.Is(err, ErrRemoveSnapshotUnknown) {
+	if _, err := RemoveNow(h, g, stale, false, nil); !errors.Is(err, ErrRemoveSnapshotUnknown) {
 		t.Errorf("snapshot failed: %v", err)
 	}
 	h.snapErr = nil
 	// The worktree list fails: open state unknown, refused.
 	h.err = map[string]error{"/r": errors.New("busy")}
-	if err := RemoveNow(h, g, stale, false); !errors.Is(err, ErrWorktreeStateUnknown) {
+	if _, err := RemoveNow(h, g, stale, false, nil); !errors.Is(err, ErrWorktreeStateUnknown) {
 		t.Errorf("list failed: %v", err)
 	}
 	if len(h.removed)+len(g.calls) != 0 {
@@ -786,7 +799,7 @@ func TestRemoveNowRefusesAChangedWorktree(t *testing.T) {
 	}
 	for name, h := range cases {
 		g := &fakeGitRemover{}
-		if err := RemoveNow(h, g, confirmed, false); !errors.Is(err, ErrRemoveChanged) {
+		if _, err := RemoveNow(h, g, confirmed, false, nil); !errors.Is(err, ErrRemoveChanged) {
 			t.Errorf("%s: want ErrRemoveChanged, got %v", name, err)
 		}
 		if len(h.removed)+len(g.calls) != 0 {
@@ -796,7 +809,7 @@ func TestRemoveNowRefusesAChangedWorktree(t *testing.T) {
 	// Unchanged: proceeds (through git, nothing open).
 	h := newClient(herdr.Worktree{Path: "/w/b", Branch: "feat-a", IsLinkedWorktree: true}, "/r")
 	g := &fakeGitRemover{}
-	if err := RemoveNow(h, g, confirmed, false); err != nil || len(g.calls) != 1 {
+	if _, err := RemoveNow(h, g, confirmed, false, nil); err != nil || len(g.calls) != 1 {
 		t.Errorf("unchanged: err=%v git=%v", err, g.calls)
 	}
 	// A detached worktree confirmed as such: still detached passes, a
@@ -804,12 +817,12 @@ func TestRemoveNowRefusesAChangedWorktree(t *testing.T) {
 	detached := Candidate{Kind: KindWorktree, Path: "/w/b", RepoRoot: "/r", OpenState: OpenClosed}
 	h = newClient(herdr.Worktree{Path: "/w/b", Branch: "HEAD", IsDetached: true, IsLinkedWorktree: true}, "/r")
 	g = &fakeGitRemover{}
-	if err := RemoveNow(h, g, detached, false); err != nil || len(g.calls) != 1 {
+	if _, err := RemoveNow(h, g, detached, false, nil); err != nil || len(g.calls) != 1 {
 		t.Errorf("still detached: err=%v git=%v", err, g.calls)
 	}
 	h = newClient(herdr.Worktree{Path: "/w/b", Branch: "main", IsLinkedWorktree: true}, "/r")
 	g = &fakeGitRemover{}
-	if err := RemoveNow(h, g, detached, false); !errors.Is(err, ErrRemoveChanged) || len(g.calls) != 0 {
+	if _, err := RemoveNow(h, g, detached, false, nil); !errors.Is(err, ErrRemoveChanged) || len(g.calls) != 0 {
 		t.Errorf("detached → main: err=%v git=%v", err, g.calls)
 	}
 }
@@ -830,7 +843,7 @@ func TestRemoveNowPlainWorkspaceAtThePathBlocks(t *testing.T) {
 	h.lists["/r"].Source.RepoRoot = "/r"
 	g := &fakeGitRemover{}
 	c := Candidate{Kind: KindWorktree, Path: "/w/b", Branch: "feat-b", RepoRoot: "/r", OpenState: OpenOpen, OpenWorkspaceID: "ws-plain", OpenCount: 1}
-	if err := RemoveNow(h, g, c, false); !errors.Is(err, ErrRemoveInside) {
+	if _, err := RemoveNow(h, g, c, false, nil); !errors.Is(err, ErrRemoveInside) {
 		t.Errorf("plain workspace at the path: want ErrRemoveInside, got %v", err)
 	}
 	if len(h.removed)+len(g.calls) != 0 {
@@ -841,7 +854,7 @@ func TestRemoveNowPlainWorkspaceAtThePathBlocks(t *testing.T) {
 	// list's answer alone refuses.
 	elsewhere := "/home/u"
 	h.snap.Panes[0].Cwd = &elsewhere
-	if err := RemoveNow(h, g, c, false); !errors.Is(err, ErrRemoveInside) {
+	if _, err := RemoveNow(h, g, c, false, nil); !errors.Is(err, ErrRemoveInside) {
 		t.Errorf("plain workspace named by the list, pane moved meanwhile: want ErrRemoveInside, got %v", err)
 	}
 	if len(h.removed)+len(g.calls) != 0 {
@@ -858,7 +871,89 @@ func TestRemoveNowPlainWorkspaceAtThePathBlocks(t *testing.T) {
 	h.snap.Workspaces[0].Worktree = &herdr.WorkspaceWorktree{CheckoutPath: "/w/b", IsLinkedWorktree: true}
 	sub := "/w/b/sub"
 	h.snap.Panes[0].Cwd = &sub
-	if err := RemoveNow(h, g, c, false); err != nil || len(h.removed) != 1 {
+	if _, err := RemoveNow(h, g, c, false, nil); err != nil || len(h.removed) != 1 {
 		t.Errorf("managed workspace: err=%v herdr=%v", err, h.removed)
+	}
+}
+
+func TestCanRemoveTheCurrentWorktreeThroughItsOwnWorkspace(t *testing.T) {
+	c := Candidate{Kind: KindWorktree, Path: "/w/c", RepoRoot: "/r", OpenState: OpenOpen, OpenWorkspaceID: "ws3", OpenCount: 1, Current: true}
+	own := Occupancy{OK: true, Occupants: []Occupant{
+		{Path: "/w/c", WorkspaceID: "ws3", Current: true, Managed: true},
+		{Path: "/w/c/sub", WorkspaceID: "ws3", Current: true, Managed: true},
+		{Path: "/home/u", WorkspaceID: "ws3", Current: true, Managed: true},
+	}}
+	if err := CanRemove(c, own); err != nil {
+		t.Errorf("the focused workspace is the worktree's own: %v", err)
+	}
+	// A focused plain workspace with a pane inside is not closed with it.
+	plain := Occupancy{OK: true, Occupants: append(own.Occupants, Occupant{Path: "/w/c/x", WorkspaceID: "ws5", Current: true})}
+	if err := CanRemove(c, plain); !errors.Is(err, ErrRemoveCurrent) {
+		t.Errorf("focused plain workspace inside: %v", err)
+	}
+}
+
+func TestRemoveNowMovesAfterRemovingTheFocusedWorktree(t *testing.T) {
+	ws3, ws2 := "ws3", "ws2"
+	newClient := func(source *string) *fakeRemoveClient {
+		h := &fakeRemoveClient{snap: &herdr.Snapshot{Workspaces: []herdr.Workspace{
+			{ID: "ws1"},
+			{ID: "ws2", Worktree: &herdr.WorkspaceWorktree{CheckoutPath: "/r"}},
+			{ID: "ws3", Focused: true, Worktree: &herdr.WorkspaceWorktree{CheckoutPath: "/w/c", IsLinkedWorktree: true}},
+		}}}
+		h.lists = map[string]*herdr.WorktreeList{"/r": {Worktrees: []herdr.Worktree{{Path: "/w/c", Branch: "feat-c", IsLinkedWorktree: true, OpenWorkspaceID: &ws3}}}}
+		h.lists["/r"].Source.RepoRoot = "/r"
+		h.lists["/r"].Source.SourceWorkspaceID = source
+		return h
+	}
+	c := Candidate{Kind: KindWorktree, Path: "/w/c", Branch: "feat-c", RepoRoot: "/r", RepoLabel: "github.com/acme/api", OpenState: OpenOpen, OpenWorkspaceID: "ws3", OpenCount: 1, Current: true}
+	for name, tc := range map[string]struct {
+		source *string
+		visits map[string]int64
+		want   string
+	}{
+		// ws3 is the newest visit (the picker was opened there) and ws9
+		// was closed meanwhile: neither is a way out.
+		"last visited":     {&ws2, map[string]int64{"ws1": 20, "ws2": 10, "ws3": 30, "ws9": 40}, "remove ws3 force=false,focus ws1"},
+		"no history":       {&ws2, nil, "remove ws3 force=false,focus ws2"},
+		"no repo either":   {nil, nil, "remove ws3 force=false,create /r label=acme/api"},
+		"source is itself": {&ws3, nil, "remove ws3 force=false,create /r label=acme/api"},
+	} {
+		h, g := newClient(tc.source), &fakeGitRemover{}
+		left, err := RemoveNow(h, g, c, false, tc.visits)
+		if err != nil || !left {
+			t.Fatalf("%s: left=%v err=%v", name, left, err)
+		}
+		if got := strings.Join(h.actions, ","); got != tc.want {
+			t.Errorf("%s: %s, want %s", name, got, tc.want)
+		}
+	}
+	// A refused removal (a dirty checkout, say) moves nobody.
+	h, g := newClient(&ws2), &fakeGitRemover{}
+	h.removeErr = errors.New("dirty_worktree_requires_force")
+	if left, err := RemoveNow(h, g, c, false, nil); err == nil || left || strings.Join(h.actions, ",") != "remove ws3 force=false" {
+		t.Errorf("refused: left=%v err=%v actions=%v", left, err, h.actions)
+	}
+	// Removed, but the move failed: the workspace is still gone.
+	h, g = newClient(&ws2), &fakeGitRemover{}
+	h.focusErr = errors.New("socket gone")
+	if left, err := RemoveNow(h, g, c, false, nil); !errors.Is(err, ErrRefocus) || !left || len(h.removed) != 1 {
+		t.Errorf("focus failed: left=%v err=%v removed=%v", left, err, h.removed)
+	}
+	// Another workspace (ws1) is focused: herdr's switch to the
+	// repository's workspace is undone, whatever the history says.
+	h, g = newClient(&ws2), &fakeGitRemover{}
+	h.snap.Workspaces[2].Focused, h.snap.Workspaces[0].Focused = false, true
+	c.Current = false
+	if left, err := RemoveNow(h, g, c, false, map[string]int64{"ws2": 50}); err != nil || left || strings.Join(h.actions, ",") != "remove ws3 force=false,focus ws1" {
+		t.Errorf("not focused: left=%v err=%v actions=%v", left, err, h.actions)
+	}
+	// Removed through git: no workspace closed, focus is left alone.
+	h, g = newClient(&ws2), &fakeGitRemover{}
+	h.snap.Workspaces[2].Focused, h.snap.Workspaces[0].Focused = false, true
+	h.lists["/r"].Worktrees[0].OpenWorkspaceID = nil
+	h.snap.Workspaces = h.snap.Workspaces[:2]
+	if left, err := RemoveNow(h, g, c, false, nil); err != nil || left || len(h.actions) != 0 || len(g.calls) != 1 {
+		t.Errorf("through git: left=%v err=%v actions=%v git=%v", left, err, h.actions, g.calls)
 	}
 }

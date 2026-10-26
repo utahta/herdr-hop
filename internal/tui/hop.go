@@ -99,8 +99,10 @@ type wtStateMsg struct {
 type doneMsg struct{ err error }
 
 // removedMsg carries the selection to restore after a successful deletion.
+// left: the deleted worktree's workspace was the focused one.
 type removedMsg struct {
 	focusRow *hop.Candidate
+	left     bool
 	err      error
 }
 
@@ -316,7 +318,7 @@ func (m *HopModel) endRemove() {
 // herdr at that moment (hop.RemoveNow): the rows' state served to decide
 // whether to ask, not to act.
 func (m HopModel) remove(c hop.Candidate) tea.Cmd {
-	h, git := m.h, m.git
+	h, git, visits := m.h, m.git, m.visits
 	focusRow := &hop.Candidate{Kind: hop.KindRepo, Path: c.RepoRoot}
 	if strings.TrimSpace(m.input.Value()) != "" {
 		focusRow = nil
@@ -327,7 +329,8 @@ func (m HopModel) remove(c hop.Candidate) tea.Cmd {
 		}
 	}
 	return func() tea.Msg {
-		return removedMsg{focusRow: focusRow, err: hop.RemoveNow(h, git, c, false)}
+		left, err := hop.RemoveNow(h, git, c, false, visits)
+		return removedMsg{focusRow: focusRow, left: left, err: err}
 	}
 }
 
@@ -804,12 +807,24 @@ func (m HopModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case removedMsg:
 		m.pending = false
+		if errors.Is(msg.err, hop.ErrRefocus) {
+			// The checkout is gone; focus stays wherever herdr put it.
+			m.log.Printf("remove worktree: %v", msg.err)
+			msg.err = nil
+		}
 		if msg.err != nil {
 			m.errMsg = removeErrorText(msg.err)
 			m.log.Printf("remove worktree: %v", msg.err)
 			return m, nil
 		}
 		m.log.Printf("remove worktree: done")
+		if msg.left {
+			// The workspace the picker was opened from is gone: like Enter,
+			// the picker ends.
+			m.quit = true
+			m.cancelAll()
+			return m, tea.Quit
+		}
 		m.focusRow = msg.focusRow
 		return m, m.startLoad()
 	case doneMsg:
@@ -1669,6 +1684,9 @@ func (m HopModel) View() string {
 	}
 	if m.confirm != nil {
 		hints = []keyHint{{"y", "delete the checkout (the branch is kept)"}, {"any other key", "keep it"}}
+		if m.confirm.cand.Current {
+			hints[0].desc = "delete the checkout and go to the last workspace (the branch is kept)"
+		}
 	}
 	writeln(clip(renderKeyHints(hints)))
 	if m.resolvingQuery() {
