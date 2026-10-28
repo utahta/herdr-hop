@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -680,6 +681,61 @@ func TestRemoveRoutesAndRefuses(t *testing.T) {
 	}
 	if len(h.calls)+len(g.calls) != 2 {
 		t.Errorf("refusals must not call anything: %v %v", h.calls, g.calls)
+	}
+}
+
+func TestRemoveMakesReadOnlyDirectoriesWritable(t *testing.T) {
+	// Tools install binaries into read-only directories; git cannot delete
+	// their entries, and a removal failing partway still unregisters the
+	// worktree.
+	root := t.TempDir()
+	wt := filepath.Join(root, "wt")
+	ro := filepath.Join(wt, "bin", "k8s")
+	outside := filepath.Join(root, "outside")
+	for _, d := range []string{ro, outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(ro, "etcd"), []byte("x"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(wt, "link")); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{ro, outside} {
+		os.Chmod(d, 0o555)
+	}
+	t.Cleanup(func() { os.Chmod(ro, 0o755); os.Chmod(outside, 0o755) })
+	perm := func(p string) os.FileMode {
+		t.Helper()
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Mode().Perm()
+	}
+
+	h, g := &fakeRemover{}, &fakeGitRemover{}
+	c := Candidate{Kind: KindWorktree, Path: wt, RepoRoot: "/r", OpenState: OpenClosed}
+	inUse := Occupancy{OK: true, Occupants: []Occupant{{Path: wt, WorkspaceID: "other"}}}
+	if err := Remove(h, g, c, inUse, false); !errors.Is(err, ErrRemoveInside) {
+		t.Fatalf("in use: %v", err)
+	}
+	if got := perm(ro); got != 0o555 {
+		t.Errorf("a refused removal must not touch permissions: %v", got)
+	}
+	if err := Remove(h, g, c, Occupancy{OK: true}, false); err != nil || len(g.calls) != 1 {
+		t.Fatalf("err=%v git=%v", err, g.calls)
+	}
+	if got := perm(ro); got != 0o755 {
+		t.Errorf("read-only directory: %v, want 0755", got)
+	}
+	if got := perm(filepath.Join(ro, "etcd")); got != 0o555 {
+		t.Errorf("files need no change to be deleted: %v", got)
+	}
+	if got := perm(outside); got != 0o555 {
+		t.Errorf("a symlink out of the checkout must not be followed: %v", got)
 	}
 }
 

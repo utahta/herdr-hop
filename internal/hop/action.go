@@ -3,6 +3,8 @@ package hop
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -303,10 +305,27 @@ func Remove(h WorktreeRemover, g GitWorktreeRemover, c Candidate, occ Occupancy,
 	if err := CanRemove(c, occ); err != nil {
 		return err
 	}
+	makeDirsWritable(c.Path)
 	if c.IsOpen() {
 		return h.WorktreeRemove(c.OpenWorkspaceID, force)
 	}
 	return g.WorktreeRemove(c.RepoRoot, c.Path, force)
+}
+
+// makeDirsWritable adds owner write permission to every directory under
+// path, not following symlinks: `git worktree remove` cannot delete the
+// entries of a read-only one, and failing partway it still unregisters
+// the worktree. Errors are left for the removal to report.
+func makeDirsWritable(path string) {
+	filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.Mode().Perm()&0o200 == 0 {
+			os.Chmod(p, info.Mode().Perm()|0o200)
+		}
+		return nil
+	})
 }
 
 // WorkspaceLabel derives the workspace label from a candidate label. Only a
