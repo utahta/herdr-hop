@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.5.2](https://github.com/utahta/herdr-hop/compare/v0.5.1...v0.5.2) - 2026-10-28
+
+- Make read-only directories writable before removing a worktree by @utahta in https://github.com/utahta/herdr-hop/pull/15
+
 ## [v0.5.1](https://github.com/utahta/herdr-hop/compare/v0.5.0...v0.5.1) - 2026-10-26
 
 - Allow deleting the current worktree and keep focus after deletions by @utahta in https://github.com/utahta/herdr-hop/pull/13
